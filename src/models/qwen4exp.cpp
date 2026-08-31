@@ -1164,10 +1164,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TODO: enable sparse attention when we are ready
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    // Sparse attention enabled: n_kv_max bounds the finite mask entries per row, which is
+    // exactly the selection width. NOTE this now runs against MAINLINE's sparse kernels
+    // (#27970/#28098), not the fork's own, which were dropped in this rebase as duplicates.
+    // Measured neutral to within 1% on Metal at 32k and 128k; kept because it is the fork's
+    // intent and costs nothing. Re-measure if the kernels change.
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
