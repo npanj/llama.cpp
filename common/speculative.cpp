@@ -1448,7 +1448,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // ctx_other is overloaded: gemma4 sets it to SHARE THE TARGET'S KV, while eagle3,
+        // dflash and a shared qwen4exp mtp- sidecar set it only to BORROW TENSORS. Testing
+        // ctx_other alone put the tensor-borrowers on gemma4's KV path, which cost 25% decode
+        // (drafts 106 -> 71, acceptance 0.943 -> 0.887) for reasons nothing to do with weights.
+        // Test the thing the flag actually names: is the memory the same object?
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt &&
+                        llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {

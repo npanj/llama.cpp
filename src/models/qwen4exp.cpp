@@ -194,8 +194,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, tf);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    // never tie to a token_embd a borrowing sidecar does not have
-    if (output == NULL && tok_embd != NULL) {
+    // Never tie for a sidecar. tie_word_embeddings is false for this model, so token_embd is NOT a
+    // usable lm_head: measured, tying one collapses draft acceptance to 0/14 while still producing
+    // correct text, because the target verifies every rejected draft. A sidecar that omits output
+    // borrows the target's instead; only a full model may fall back to the tie.
+    if (output == NULL && tok_embd != NULL && !mtp_only) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
