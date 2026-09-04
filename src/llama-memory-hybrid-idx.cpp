@@ -66,11 +66,20 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
         // Quantization can change the discrete top-k block selection. Keep the raw index keys in
-        // f16 by default; the unused V side remains in the requested type to limit memory growth.
+        // f16 by default.
         const ggml_type type_idx_k = qwen4exp_indexer_f16() ? GGML_TYPE_F16 : type_k;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, K (%s), V (%s)\n",
-                __func__, kv_size, ggml_type_name(type_idx_k), ggml_type_name(type_v));
+        // The indexer never reads V - only the keys are scored. Present the cache to
+        // llama_kv_cache as MLA-shaped, which is the flag it already uses to skip the V side
+        // entirely (llama-kv-cache.cpp: `const bool has_v = !is_mla`), instead of allocating a
+        // V cache that nothing touches. Saves n_idx_layers * kv_size * indexer_head_size *
+        // sizeof(type_v): 12 * 128 bytes per cell for this checkpoint, i.e. 288 MiB of f16 at
+        // ctx 98304 and 384 MiB at 131072. ref: upstream PR #28330.
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, K (%s), no V\n",
+                __func__, kv_size, ggml_type_name(type_idx_k));
 
         return new llama_kv_cache(
             model, hparams_idx, type_idx_k, type_v, v_trans, offload, unified,
