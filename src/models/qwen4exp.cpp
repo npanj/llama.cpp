@@ -24,6 +24,24 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
     }
 }
 
+// An mtp- sidecar can leave out token_embd/output and borrow the target's, which are already
+// resident: they are ~1.2 GiB of the head at Q8_0 and byte-identical to the target's copies.
+// Returns the target model, or throws with a message that names the actual mistake.
+static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
+    if (cparams.ctx_other == nullptr) {
+        throw std::runtime_error(format("qwen4exp MTP: this draft head carries no '%s' of its own; "
+                                        "load it as a draft of its target (-md), not on its own", name));
+    }
+    const llama_model & other = *llama_get_model(cparams.ctx_other);
+    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
+        throw std::runtime_error(format("qwen4exp MTP: draft and target disagree on the shape of '%s' "
+                                        "(n_embd %u vs %u, vocab %u vs %u)", name,
+                                        model.hparams.n_embd, other.hparams.n_embd,
+                                        (unsigned) model.vocab.n_tokens(), (unsigned) other.vocab.n_tokens()));
+    }
+    return other;
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // NextN/MTP (same convention as qwen35): the GGUF block count includes the MTP
     // block(s); n_layer() = n_layer_all - n_layer_nextn is the trunk
@@ -164,7 +182,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
     const int tf        = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // tf, not 0: a sidecar may omit token_embd and borrow the target's at graph time
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, tf);
 
     // there is no output_norm: the final hyper-connection mixer carries it.
     // tf, NOT 0: an mtp- sidecar carries only the NextN block plus embeddings, so these three are
@@ -175,7 +194,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, tf);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    // never tie to a token_embd a borrowing sidecar does not have
+    if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -369,7 +389,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * tok_embd;
     if (ubatch.token) {
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        ggml_tensor * embd_w = model.tok_embd ? model.tok_embd
+                             : qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
+        tok_embd = ggml_get_rows(ctx0, embd_w, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
@@ -575,7 +597,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         final = ggml_get_rows(ctx0, final, inp_out_ids);
     }
 
-    ggml_tensor * logits = build_lora_mm(model.output, final, model.output_s);
+    ggml_tensor * out_w = model.output ? model.output
+                        : qwen4exp_shared_model(cparams, model, "output.weight").output;
+    ggml_tensor * logits = build_lora_mm(out_w, final, model.output_s);
     cb(logits, "result_output", -1);
 
     res->t_logits = logits;
