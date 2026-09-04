@@ -1329,7 +1329,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             std::getenv("LLAMA_MOE_STREAM_NO_HASH_PREFETCH") == nullptr) {
         bool any = false;
         for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count; il++) {
-            mstream->register_hash_router((int32_t) il, model.layers[il].ffn_gate_tid2eid, hparams.n_expert_used);
+            mstream->register_hash_router((int32_t) il, model.layers[il].ffn_gate_tid2eid, hparams.n_expert_used(il));
             any = true;
         }
         if (any && !mstream->hash_routers.empty()) {
