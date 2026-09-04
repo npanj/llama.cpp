@@ -1298,8 +1298,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
+        // both MTP types need the draft context built as an MTP context; without this the
+        // sidecar (which carries no trunk tensors) is loaded as an ordinary draft model and
+        // the fit step segfaults before the target model finishes loading
         const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
+                               std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
 
         common_params params_dft = common_base_params_to_speculative(params);
 
