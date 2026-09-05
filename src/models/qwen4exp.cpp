@@ -855,6 +855,22 @@ static bool qwen4exp_block_topk() {
     return enabled;
 }
 
+// Pass the selection width to the flash-attention kernel as n_kv_max, so it can stop at the
+// finite mask entries instead of walking the whole row. ON by default.
+//
+// LLAMA_QWEN4EXP_SPARSE_FA=0 turns it off. The gate exists because the only measurement behind
+// this - neutral to within 1% at 32k and 128k - was taken against THIS FORK'S sparse kernels,
+// which the mainline rebase dropped as duplicates of #27970/#28098. The hint now reaches
+// mainline's kernels instead, and has never been measured in that form. Re-measure before
+// trusting the "neutral" number, and use this to A/B it without a rebuild.
+static bool qwen4exp_sparse_fa() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_QWEN4EXP_SPARSE_FA");
+        return !e || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, int64_t n_kv, bool blk_bias, bool block_topk) :
@@ -1191,12 +1207,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // Sparse attention enabled: n_kv_max bounds the finite mask entries per row, which is
-    // exactly the selection width. NOTE this now runs against MAINLINE's sparse kernels
-    // (#27970/#28098), not the fork's own, which were dropped in this rebase as duplicates.
-    // Measured neutral to within 1% on Metal at 32k and 128k; kept because it is the fork's
-    // intent and costs nothing. Re-measure if the kernels change.
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    // n_kv_max bounds the finite mask entries per row, which is exactly the selection width.
+    // See qwen4exp_sparse_fa() for why this is gated: it now feeds mainline's kernels, not the
+    // fork's own, and has not been measured in that form. 0 leaves the kernel dense.
+    const int64_t n_kv_max = qwen4exp_sparse_fa() ? top_k->ne[0] : 0;
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

@@ -232,7 +232,7 @@ is the opposite of the finding for multi-MiB expert slabs.
 | **MTP at long context** | **inverts.** At 32k the head costs 3.7 s of prefill and repays after 119 generated tokens; at 128k it costs 57.7 s and repays after 2369 |
 | **union-8 for MTP** | does not apply |
 | **Deeper drafts** | the expert GEMV n-curve is linear with a cliff at 32; depth does not amortise the weight read |
-| **Upstream's `n_kv_max` sparse-FA hint for QSA** (`#27970`/`#28098`) | neutral to within 1% at 32k and 128k. QSA's selection is scattered — top-k picks ~512 four-cell blocks across the whole cache, so nearly every block the kernel could skip still holds a selected cell. Off by default behind `LLAMA_QWEN4EXP_SPARSE_FA` |
+| **Upstream's `n_kv_max` sparse-FA hint for QSA** (`#27970`/`#28098`) | neutral to within 1% at 32k and 128k. QSA's selection is scattered — top-k picks ~512 four-cell blocks across the whole cache, so nearly every block the kernel could skip still holds a selected cell. **On by default; `LLAMA_QWEN4EXP_SPARSE_FA=0` disables.** See the caveat below |
 | **Upstream `#28213` gather-based QSA decode** | 5% slower at 32k, 6% at 128k. It sets `blk_bias = false` to get the per-cell bias, which turns **block top-k off** — that optimisation is worth more than the gather, and the per-query sparse FA above already covers the idea. Not adopted |
 
 **Standing rule: no output-altering optimizations.** Quality is not tradeable for single-digit
@@ -265,6 +265,25 @@ endpoint, which bypasses the chat template. Under `--jinja` — what the server 
 **Upstream's `edb6dec1c` "enable recurrent state rollback" looks wrong**: it adds `QWEN4EXP` to the
 whitelist, but their tree has neither the ring-bank conv writes nor the delta-net `n_written < K`
 clamp, both prerequisites.
+
+**"Sparse FA for QSA is neutral, and off by default behind `LLAMA_QWEN4EXP_SPARSE_FA`."** Both
+halves were wrong, and this entry is the reason the gate now exists.
+
+The flag was never real — no such env var existed anywhere in the tree, on this branch or the one
+before it. Sparse FA has been **on unconditionally** since `39b1d9ae8`, which replaced the disabled
+call with `top_k->ne[0]`.
+
+The "neutral to within 1%" number is worse than stale. It was measured against **this fork's own
+sparse kernels**, and the mainline rebase dropped those as duplicates of `#27970`/`#28098`. The
+hint now reaches mainline's kernels, which are different code. Nobody has measured it in that form.
+
+The gate is now implemented for real (`qwen4exp_sparse_fa()`), still **on by default** so the
+behaviour does not change under anyone silently, with `LLAMA_QWEN4EXP_SPARSE_FA=0` to A/B it
+without a rebuild. **Re-measure before quoting the neutral figure again.**
+
+The general lesson is the one this log keeps relearning: a measurement is only as portable as the
+code underneath it, and a rebase can move that code without touching the line that records the
+result.
 
 ---
 
