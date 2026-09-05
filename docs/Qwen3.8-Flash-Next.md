@@ -1,6 +1,14 @@
 # Qwen3.8-Flash-Next (`qwen4exp`)
 
-> Research log. Measured on **M1 Max, 64 GB, ~400 GB/s**, streaming experts from SSD.
+> Research log. Conditions are quoted with every figure — in this log more than most, because
+> several measurements here were later found to have been taken under conditions that invalidated
+> them. See [Measurement discipline](#measurement-discipline).
+
+> [!IMPORTANT]
+> **The machine changed.** Figures carried over from before 2026-09-03 were taken on an
+> **M1 Max, 64 GB, ~400 GB/s**. This laptop now reports **Apple M5 Pro, 64 GB**, which runs this
+> model at roughly 2x the M1 Max figures. Never compare a measurement against an older one without
+> checking which machine it came from.
 
 Where DeepSeek is a streaming problem, Qwen3.8-Flash-Next is a **graph-shape** problem. It decodes
 fast enough that the bottleneck moved off the disk entirely and onto GPU work the graph did not need
@@ -9,8 +17,8 @@ proportional to context × chunk size on every layer.
 
 Three architectural features make it unusual, and all three cost real work to support:
 
-- **Hyper-connections** — four parallel residual streams instead of one, mixed by a low-rank gate,
-  and the source of several fusion-breaking reshapes.
+- **Hyper-connections** — four parallel residual streams instead of one, mixed by a low-rank gate.
+  Roughly 30% of decode GPU time, and the source of several fusion-breaking reshapes.
 - **A 26.82 GiB PLE table** — far larger than RAM, touched a few rows at a time.
 - **Gated DeltaNet on 36 of 48 layers**, with 12 full-attention layers carrying a sparse indexer.
 
@@ -28,7 +36,7 @@ Three architectural features make it unusual, and all three cost real work to su
 | Expert shape | `ffn_gate/up_exps` 2560 → 640, `ffn_down_exps` 640 → 2560 |
 | PLE table | 26.82 GiB, 90-byte rows — streamed, never resident |
 | Checkpoint | `UD-iQ4_K_XXS`, 82.89 GiB, 3 shards (custom, see below) |
-| Speculation | **native MTP head** (`mtp-…-Q4_0.gguf`, 2.2 GiB) |
+| Speculation | **native MTP head** (`mtp-…-Q4_0.gguf`, 2.2 GiB), `n-max 3`, `p-min 0.3` |
 | KV | F16 |
 
 ```bash
@@ -36,8 +44,8 @@ llama-server -m <first shard> \
   -ngl 99 --moe-stream --moe-stream-cache 32 --moe-stream-io-threads 8 \
   -c 131072 -b 4096 -ub 4096 -cms 4096 -np 1 -fa on \
   -md <mtp-…-Q4_0.gguf> \
-  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0 --spec-draft-ngl 99 \
-  --spec-max-prompt 65536
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 --spec-draft-ngl 99 \
+  --spec-max-prompt 0
 ```
 
 **Cache 30-32 with MTP.** Wired memory cannot be swapped and `iogpu.wired_limit` is 58 of 64 GiB, so
@@ -205,6 +213,7 @@ is the opposite of the finding for multi-MiB expert slabs.
 | **Indexer cache after sequence copies** | cached indexer keys are raw, so a pending update must not rope-shift them |
 | **Spare-block members in `set_input_qsa`** | the unpooled tail — the newest tokens — drops out of the selection entirely |
 | **`--spec-max-prompt`** | a draft head is an extra layer over the whole prompt; past a length it cannot pay back |
+| **No V cache for the indexer** | the indexer scores keys only; the cache was allocating a V side nothing reads. Presenting its private hparams as MLA-shaped takes `llama_kv_cache`'s existing `has_v = !is_mla` path. Frees 12 × `n_ctx` × 128 B — 288 MiB at ctx 98304, 384 MiB at 131072 (upstream `#28330`) |
 
 ---
 
@@ -220,6 +229,277 @@ is the opposite of the finding for multi-MiB expert slabs.
 | **`hc_up` matmul at K=320** | a wash, not a win |
 | **Upstream `5ea1b124` fa-vec tunings** | rejected — no F16 entry matches head dim 256/256 |
 | **Swapping upstream's head-slice sum for our permute-free scoring** | upstream `#28023` already removes the same copy a different way; replacing it is a swap, not a gain |
+| **MTP at long context** | **inverts.** At 32k the head costs 3.7 s of prefill and repays after 119 generated tokens; at 128k it costs 57.7 s and repays after 2369 |
+| **union-8 for MTP** | does not apply |
+| **Deeper drafts** | the expert GEMV n-curve is linear with a cliff at 32; depth does not amortise the weight read |
+| **Upstream's `n_kv_max` sparse-FA hint for QSA** (`#27970`/`#28098`) | neutral to within 1% at 32k and 128k. QSA's selection is scattered — top-k picks ~512 four-cell blocks across the whole cache, so nearly every block the kernel could skip still holds a selected cell. Off by default behind `LLAMA_QWEN4EXP_SPARSE_FA` |
+| **Upstream `#28213` gather-based QSA decode** | 5% slower at 32k, 6% at 128k. It sets `blk_bias = false` to get the per-cell bias, which turns **block top-k off** — that optimisation is worth more than the gather, and the per-query sparse FA above already covers the idea. Not adopted |
 
 **Standing rule: no output-altering optimizations.** Quality is not tradeable for single-digit
 percentage gains.
+
+---
+
+## Retractions
+
+**"union-8 gives +4.3% / +6.1%."** Voided — measured on a **broken kernel**.
+
+**"The dk256 union failure is a head-dimension problem."** Also wrong. The root cause was the
+**CPU reference's** GQA head mapping; the Metal kernel had been correct all along.
+
+**"Long-context decode collapses."** Wrong. The measurements behind it were 1–8 token generations
+that hit EOS immediately. Measured properly with `ignore_eos`, decode at 122k is 7.13 (no spec) /
+8.63 (MTP).
+
+**"Block-topk is worth +18.5%."** Under-reported — measured at 32k, where the quadratic is only 18%
+of prefill. At 128k it is worth far more.
+
+**"MTP n-max 4."** Then "n-max 2 beats 4". Both superseded: a 22-arm sweep on a real ~24k prompt
+settled on **n-max 3, p-min 0.3**, bracketed again at 44.8k, and re-confirmed 2026-09-04 with the
+n-gram chain in front. The three figures come from different machines and checkpoints.
+
+**"Chaining n-gram in front of MTP roughly doubles decode."** Measured on the raw `/completion`
+endpoint, which bypasses the chat template. Under `--jinja` — what the server actually runs — it is
++9.9% on code and **−6.6% on reasoning**. See [Speculation stack](#speculation-stack-2026-09-04).
+
+**Upstream's `edb6dec1c` "enable recurrent state rollback" looks wrong**: it adds `QWEN4EXP` to the
+whitelist, but their tree has neither the ring-bank conv writes nor the delta-net `n_written < K`
+clamp, both prerequisites.
+
+---
+
+## Speculation stack (2026-09-04)
+
+Does chaining `ngram-mod` in front of the MTP head pay? It depends entirely on the endpoint, which
+is why the first answer was wrong. Both tables: v3 checkpoint, cache 32, ctx 32768, `np 1`,
+n-max 3 / p-min 0.3, one warmup discarded, arm order reversed between passes, swap flat throughout.
+
+**Raw `/completion`, no chat template:**
+
+| traffic | chain off (A/B) | chain on (A/B) | delta | acceptance |
+|---|---|---|---|---|
+| code | 29.77 / 28.37 | 61.95 / 62.25 | +113% | 1.000 both |
+| prose | 19.91 / 20.06 | 21.21 / 21.06 | +5.8% | 0.572 both |
+| reason | 25.07 / 24.58 | 26.34 / 25.87 | +5.1% | 0.770 both |
+
+**`/v1/chat/completions` with `--jinja --reasoning-format deepseek`, i.e. the real serving flags:**
+
+| traffic | chain off (A/B) | chain on (A/B) | delta | acceptance off → on |
+|---|---|---|---|---|
+| code | 28.71 / 28.33 | 31.39 / 31.31 | +9.9% | 0.685 → 0.626 |
+| prose | 20.34 / 19.74 | 20.28 / 20.27 | +1.2% | 0.512 → 0.468 |
+| reason | 27.75 / 26.48 | 25.79 / 24.85 | **−6.6%** | 0.780 → 0.613 |
+
+Thinking is on by default under that template, so 800–1200 characters of reasoning precede every
+answer, and reasoning text drafts like prose. The +113% depended on acceptance being 1.000 — the
+drafter was copying the prompt back. With thinking on it cannot, and reasoning regresses. This is
+the mechanism behind the older "MTP + n-gram stacked is net negative" entry, and it says *when*:
+the chain only pays where the output repeats the input.
+
+`NGRAM=1` in the server script turns it on; the default is off.
+
+**n-max / p-min re-confirmed with the chain on.** Code saturates at ~62 t/s in every config, so
+prose and reason decide it. Prose prefers n2, reasoning prefers n4, and they pull about equally
+hard — mean of the two: n2 23.48, **n3 23.62**, n4 23.41, n3/p0 23.58, all within 1%. No change.
+
+---
+
+## Real traffic (2026-09-04)
+
+Two `pi` sessions on the `nitin/mainline` build (33 fork commits replayed onto upstream
+`8f83678fd`), served through `--jinja --reasoning-format deepseek`, cache 32, ctx 98304,
+n-max 3 / p-min 0.3, n-gram chain off. 9 requests, 117,249 prompt tokens, 24,610 generated.
+
+| prompt | pp t/s | generated | tg t/s | acceptance | mean draft |
+|---:|---:|---:|---:|---:|---:|
+| 54,443 | 251.1 | 226 | 18.86 | 0.760 | 3.25 |
+| 54,722 | 254.6 | 177 | 19.71 | 0.738 | 3.11 |
+| 477 | 145.6 | 739 | 18.62 | 0.660 | 2.93 |
+| 372 | 85.2 | 722 | 22.57 | 0.667 | 2.86 |
+| 7,123 | 235.2 | 11,638 | 18.94 | 0.483 | 2.37 |
+| 18 | 28.0 | 10,002 | 21.99 | 0.832 | 3.49 |
+| 32 | 28.4 | 365 | 17.12 | 0.808 | 3.39 |
+| 34 | 32.0 | 145 | 16.01 | 0.711 | 3.04 |
+| 28 | 32.9 | 596 | 15.79 | 0.517 | 2.52 |
+
+**Weighted by tokens produced: 20.16 t/s decode, 0.647 acceptance.** Weight by tokens, not by
+request - the two 10k+ generations are the session, and a simple mean (18.85 / 0.686)
+over-weights sub-100-token replies whose rate is dominated by fixed overhead. Sub-40-token
+prompts show pp 28-33 t/s for the same reason; those are not prefill measurements.
+
+Health: no errors, no aborts, swap flat at ~970 MB throughout. The mainline rebase served two
+full real sessions cleanly - better evidence for the switch than the benchmark A/B, which was
+contaminated by swap growth.
+
+MTP is worth about +40% here. Un-drafted decode brackets this depth at ~15.5 t/s at 32k and
+~9.2 at 131k, so 54k without a draft head would be roughly 13-14 against the 18.9-19.7 measured.
+
+Acceptance ranged 0.483 to 0.832 - the code-vs-reasoning split, in the wild. The two big
+generations sat at opposite ends (0.483 over 11,638 tokens, 0.832 over 10,002) yet differed by
+only 14% in throughput, which is why adaptive draft depth looked attractive and still lost.
+
+Note the session ran at 0.647, well above the 0.46-0.51 this log records for real traffic.
+One session; direction only.
+
+## Open bugs
+
+**`nan` logits on the BLAS backend, from block top-k.** `test-llama-archs -a qwen4exp`, Accelerate
+row: `NMSE nan`, roundtrip FAIL. Deterministic across seeds 1–6. Metal and pure CPU are clean, and
+the full 606-row suite has no other failure, so the Mac serving path is unaffected.
+
+`LLAMA_QWEN4EXP_BLOCK_TOPK=0` clears it. It survives `LLAMA_QSA_GATHER=0` and
+`LLAMA_QWEN4EXP_INDEXER_F16=0`, so it is not the `blk_cells` mapping bug and not the key type.
+
+Ruled out: BLAS claiming an op it does not implement (its `supports_op` is correct — only
+`NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE` and a gated `MUL_MAT`); `ggml_top_k` returning a view (it
+returns a fresh contiguous I32 tensor); an all-masked attention row (the CPU kernel skips masked
+cells and guards `S == 0`, yielding 0 rather than `nan`).
+
+What is odd: block top-k changes no matmul's shape, so BLAS takes the same matmuls either way, yet
+its presence is required to trigger the fault. That points at graph splitting or allocation — BLAS
+and CPU share a buffer type, so sched can alias buffers across splits. Needs a debug build with a
+graph-eval callback; `llama-eval-callback` cannot help because the synthesised model has no
+tokenizer, and `GGML_SCHED_DEBUG=2` is swallowed by the test's logging.
+
+---
+
+## WAVE_CAP forces off a safety net (2026-09-04)
+
+The server script exports `LLAMA_MOE_STREAM_WAVE_CAP=200`. Every start now logs:
+
+    LLAMA_MOE_STREAM_WAVE_CAP=200 forces N waves, below the 600 pairs/wave floor
+    - the static chunk bound may abort; unset it to let the planner pick
+
+This is not cosmetic. Reading `llama-graph.cpp` around the wave planner:
+
+- **200 does not mean 200.** It is clamped to `[n_expert_used, n_slots - n_expert_used]`,
+  i.e. 86 of 96 slots here. So the setting means "use the widest wave the cache allows".
+- **Forcing it disables the widening.** The planner's corrective branch is guarded by
+  `!cap_forced`, so with the env var set, the code that keeps mean pairs-per-wave above the
+  floor never runs.
+- **The floor exists because of a measured abort.** The comment records it: mean 614 pairs
+  per wave held at +20% imbalance, mean 308 blew past +43%, and "at cap 30 the tail came
+  +50.2% over, aborting between two cap values that both worked". The hazard is the small
+  TAIL ubatch of a prefill, whose hot-expert pair counts do not shrink with the ubatch.
+
+So the risk is a hard abort on an unlucky prefill tail, not a slowdown. It did not fire across
+117k prompt tokens of real traffic today, but it is disabled protection against a failure this
+log has already seen once.
+
+NOT YET MEASURED: whether 200 actually beats unset. It was adopted before pair partitioning
+became the default, and partitioning is what sizes the pair lists the floor is about. Since it
+clamps to the maximum anyway, "unset" may cost nothing. Measure before deciding.
+
+## Sweeps
+
+| Sweep | Outcome |
+|---|---|
+| **ubatch / batch** | keep **4096** |
+| **Cache size** | 36 is ~14% faster on prefill, ~2% on decode — but 36 + MTP pages. Use **32 with MTP** |
+| **MTP quantization** | `Q4_0` (2.20 GiB); Q8_0 (3.85 GiB) gives similar acceptance (0.55 vs 0.51 mean) for 1.75x the footprint |
+| **MTP n-max / p-min** | **3 / 0.3**, bracketed at 24k and 44.8k, re-confirmed with the n-gram chain in front |
+| **I/O threads with MTP** | keep **8** |
+| **Speculation type × cache** | MTP alone beats n-gram alone; the chain only pays without the chat template |
+
+---
+
+## Measurement discipline
+
+- **Measure under the flags the thing actually runs with.** The n-gram chain was measured on
+  `/completion` and recommended for a server that passes `--jinja`. The raw endpoint bypasses the
+  template, so those numbers described a configuration that never runs. Cost: one wrong default.
+- **Run A/B arms as ABA.** This box speeds up as caches warm — four identical runs at d32768 gave
+  13.55 → 14.36 → 15.37 → 15.35 t/s. A single on-then-off pair therefore reads as a loss for
+  whichever ran first. Run the feature arm on both sides of the control and check the two agree.
+- **One run per arm is not a measurement.** Spread at d32768 is ±1.4 t/s on a mean of ~15, about 9%
+  — wider than most effects worth chasing.
+- **The first request understates decode by ~25%.** Cold 12.20 → warm 16.49 / 16.26 t/s. Multi-arm
+  sweeps issuing 3+ requests per arm are unaffected; one-shot verification runs are not.
+- **That ~25% is a COLD-START effect, not warm-vs-post-prefill.** Warm decode runs only 2–16% above
+  post-prefill at the same depth. Post-prefill is the honest number for agentic use, where every
+  turn re-prefills.
+- **"It loaded" is not "it fits".** Cache 36 + MTP loads, runs, and pages while doing it. Sample
+  `sysctl -n vm.swapusage` around every arm; a rising figure voids the measurement. Watch swap, not
+  free RAM, which macOS keeps near zero by design.
+- **Warm decode measured once per context carries ~15% variance** — in one sweep the 8k warm figure
+  came out *below* its own post-prefill figure, which is physically impossible.
+- **A replay trap can fake +33%.** n-gram speculation replaying its own prior output measures
+  nothing. Acceptance of exactly 1.000 is the tell that the drafter is copying.
+- **Percentages on a curve are meaningless without the length.**
+- **Check the harness before the model.** A readiness loop waiting for the wrong log string looks
+  exactly like a hung server. The line is `llama_server: listening on http://`. Tags used as
+  filenames must not contain `/`, or every server "dies" instantly with an unwritable log.
+- **Audit 3-way patch applies for silently reverted hunks** — conflict markers show only part of
+  the damage; patch *context* can overwrite untouched work.
+- **`git stash pop` leaves merged files staged.** A later bare `git commit` absorbs them. Stage by
+  path.
+
+---
+
+## Backlog, in priority order
+
+### 1. KV cache quantization — frees memory without giving up context
+
+`-ctk q8_0 -ctv q8_0`. KV is `f16` by default; halving it frees memory for the expert cache **at the
+same context length**. At ~85 KB per token, 98,304 context is roughly 8 GB, so this could fund
+`--moe-stream-cache 40` with ctx intact.
+
+**Not lossless** — it changes stored attention keys and values. Needs paired perplexity first, then
+a speed A/B at cache 40 / ctx 98304. Check in the same run: this model is 36 SSM layers and only 12
+attention layers, so KV may be a smaller share of memory than 85 KB/token implies, in which case the
+freed memory never materialises. Note the indexer V cache is already gone (above), so part of this
+has been banked. ~90 min.
+
+### 2. Adaptive MTP draft depth (upstream `#27210`)
+
+Prose wants n2, reasoning wants n4, and a fixed n-max cannot have both — measured twice now. This
+climbs and drops the depth per request. 451 lines against a newer mainline than this tree, so it
+will not apply cleanly. The most principled fix for the split above.
+
+### 3. The remaining streaming toggles
+
+`WAVE_CAP` and `PARTITION` are done and adopted. `LRU` is skipped — its own comment records +11%
+misses. Left, all lossless: **`HOT_DECAY`** (halves route-hotness every 64 remaps; the constant "has
+never been measured"), **`PAIR_SLACK`** (50% slack on per-wave pair capacity, more interesting now
+that partitioning sizes the pair lists), **`SPEC_MAX`** (prefetch queue depth, default 64).
+
+### 4. A smaller draft head — lossless, modest
+
+Only *below* `Q4_K_M` can win. A `Q3_K_M` head (~2.26 GiB) must hold acceptance above **0.813**;
+`shared-Q4_K_M` (1.78 GiB) needs 0.783 but omits `token_embd`/`output` and may not load. A few
+percent at best. ~40 min.
+
+### 5. The MTP head runs dense despite shipping sparse weights
+
+A code change rather than a measurement, and the head is ~18% of a decode step. Unscoped.
+
+### 6. F16 `256/256` flash-attention vector tunings
+
+Upstream never tuned this shape. Code plus tuning generation. Unscoped.
+
+---
+
+## Housekeeping
+
+- **The long-form measurement detail lives in `Qwen3.8-Flash-Next.WIP-yours.md`** (1052 lines,
+  uncommitted). This log is the condensed spine; that file still holds the only copy of the
+  per-context performance sweeps, the M5 Pro run book, the PLE buffered-vs-uncached study, the
+  `GGML_METAL_KPROF` decode breakdown, and the Unsloth variant audit. Fold in or delete
+  deliberately — do not lose it by accident.
+- **Re-baseline the pre-M5-Pro half of this log, or mark it historical.** Figures older than
+  2026-09-03 are M1 Max, several on a checkpoint that no longer exists.
+- **Decide whether to keep `LLAMA_MOE_STREAM_PLE_DIRECT`.** Correct, off by default, buys nothing
+  measurable. The alternative is deleting it.
+- `~/models/qwen38-flash-next-v2` (97 GiB) is superseded by v3 and can be deleted.
+- The PLE buffer-overflow fix in `src/llama-moe-stream.cpp` is still uncommitted.
+
+## Closed
+
+- **`--spec-max-prompt`**: set to 0. The limit is cache-blind and disabled MTP mid-conversation.
+- **Draft depth and p-min**: `n-max 3`, `p-min 0.3`, bracketed at 24k and 44.8k, re-confirmed 09-04.
+- **io-threads and `-ub`**: 8 and 4096 already optimal; `-ub 8192` GPU-OOMs at cache 36.
+- **A bigger draft head**: measured −5.2%. Q5/Q6/BF16/F32 all ruled out by the cost model.
+- **Per-block bitmap for union-8**: lifted the ceiling 4x, no throughput gain at reachable contexts.
+- **MXFP4 vs block-level top-k attribution**: blocked, the `UD-iQ4_K_XXS` checkpoint was deleted.
+- **n-gram chained in front of MTP**: measured on both endpoints; opt-in, off by default.
+- **Indexer V cache**: removed, 288 MiB at ctx 98304.
