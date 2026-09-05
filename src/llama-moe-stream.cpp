@@ -452,9 +452,17 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         if (ple.file_idx >= paths.size()) {
             throw std::runtime_error("PLE row streaming file index is out of range");
         }
-        ple_file = std::make_unique<llama_file>(paths[ple.file_idx].c_str(), "rb", false);
-        LLAMA_LOG_WARN("%s: PLE row streaming enabled: %.2f GiB table, %zu-byte rows, buffered parallel reads\n",
-                __func__, (double) (ple.row_size * (size_t) ple.n_rows) / (1024.0*1024.0*1024.0), ple.row_size);
+        // buffered is the default. LLAMA_MOE_STREAM_PLE_DIRECT reads the rows uncached instead;
+        // measured level with buffered on M5 Pro, so it is an experiment knob, not a tuning.
+        ple_direct = std::getenv("LLAMA_MOE_STREAM_PLE_DIRECT") != nullptr;
+        ple_file = std::make_unique<llama_file>(paths[ple.file_idx].c_str(), "rb", ple_direct);
+        if (ple_direct && !ple_file->has_direct_io()) {
+            LLAMA_LOG_WARN("%s: PLE direct reads not available, falling back to buffered\n", __func__);
+            ple_direct = false;
+        }
+        LLAMA_LOG_WARN("%s: PLE row streaming enabled: %.2f GiB table, %zu-byte rows, %s parallel reads\n",
+                __func__, (double) (ple.row_size * (size_t) ple.n_rows) / (1024.0*1024.0*1024.0), ple.row_size,
+                ple_direct ? "direct" : "buffered");
     }
 
     // fall back to buffered when O_DIRECT is unusable: either the open did not honor it (macOS,
@@ -551,8 +559,13 @@ void llama_moe_stream::worker_loop() {
             q_ple.pop_front();
 
             lk.unlock();
-            const uint8_t * data = llama_moe_stream_pread(*ple_file, w.dst, ple.row_size,
-                    ple.offs + (size_t) w.row*ple.row_size, /*direct =*/ false);
+            // a direct read is block-aligned, so it needs the head/tail slack staging has - aimed
+            // straight at a row-sized dst it would scribble past the row. Bounce and copy out.
+            const uint8_t * data = llama_moe_stream_pread(*ple_file, ple_direct ? staging : w.dst,
+                    ple.row_size, ple.offs + (size_t) w.row*ple.row_size, ple_direct);
+            if (ple_direct && data != nullptr) {
+                memcpy(w.dst, data, ple.row_size);
+            }
             lk.lock();
 
             if (data == nullptr) {

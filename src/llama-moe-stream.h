@@ -295,7 +295,8 @@ struct llama_moe_stream {
     llama_files files; // privately reopened GGUF files, same indices as the loader's
 
     llama_moe_stream_ple ple;
-    std::unique_ptr<llama_file> ple_file; // always buffered; tiny PLE rows benefit from the page cache
+    std::unique_ptr<llama_file> ple_file; // buffered by default
+    bool ple_direct = false;              // LLAMA_MOE_STREAM_PLE_DIRECT reads the rows uncached instead
 
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
