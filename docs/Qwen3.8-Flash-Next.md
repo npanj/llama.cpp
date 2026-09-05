@@ -543,11 +543,29 @@ attention layers, so KV may be a smaller share of memory than 85 KB/token implie
 freed memory never materialises. Note the indexer V cache is already gone (above), so part of this
 has been banked. ~90 min.
 
-### 2. Adaptive MTP draft depth (upstream `#27210`)
+### 2. Adaptive MTP draft depth (upstream `#27210`) — **ported, unmeasured**
 
 Prose wants n2, reasoning wants n4, and a fixed n-max cannot have both — measured twice now. This
-climbs and drops the depth per request. 451 lines against a newer mainline than this tree, so it
-will not apply cleanly. The most principled fix for the split above.
+climbs and drops the depth per request, so one setting can serve both. The most principled fix for
+the split above.
+
+**The port is done and on this branch**, not pending: `--spec-type draft-mtp-adaptive`. It reached
+`nitin/mainline` late, having been written on `claude/adaptive-mtp` before the rebase and left
+behind by it — an earlier version of this entry said it "will not apply cleanly", written when the
+port did not exist yet. Both unit tests pass (`test-speculative-adaptive`, `test-arg-parser`).
+
+Two fork-specific conflicts were resolved on the way in. `common/speculative.cpp` — upstream widens
+its `spec_mtp` test to include the adaptive type, while this fork carries a `spec_block` clause for
+DFLASH/DSPARK that upstream does not have; both kept. And this fork has a **fourth** `DRAFT_MTP`
+test upstream does not, in the `-fit` branch of `common_init_from_params`, which decides whether the
+draft context is built as `LLAMA_CONTEXT_TYPE_MTP`. With only the non-adaptive type tested,
+`--spec-type draft-mtp-adaptive` left `ctx_type` unset and the MTP sidecar — which carries no trunk
+tensors — was loaded as a full model and segfaulted.
+
+**What is left is the measurement, not the code.** It has never been run against real traffic here.
+The bar it has to clear is the fixed `n-max 3 / p-min 0.3`, whose own sweep put prose and reasoning
+within 1% of each other, so the win it is chasing is small and the acceptance range in live traffic
+(0.483–0.832) is wider than anything the sweep saw.
 
 ### 3. The remaining streaming toggles
 
