@@ -35,27 +35,82 @@ Three architectural features make it unusual, and all three cost real work to su
 | Hyper-connections | `hc = 4` streams |
 | Expert shape | `ffn_gate/up_exps` 2560 → 640, `ffn_down_exps` 640 → 2560 |
 | PLE table | 26.82 GiB, 90-byte rows — streamed, never resident |
-| Checkpoint | `UD-iQ4_K_XXS`, 82.89 GiB, 3 shards (custom, see below) |
-| Speculation | **native MTP head** (`mtp-…-Q4_0.gguf`, 2.2 GiB), `n-max 3`, `p-min 0.3` |
+| Checkpoint | **`Q4_0-Q8out-v3`, 95.5 GiB, 3 shards** (custom, see below). `UD-iQ4_K_XXS` at 82.89 GiB is the smaller alternative |
+| Speculation | **native MTP head**, shared (`mtp-shared-Q4_K_M.gguf`, 1.776 GiB), `n-max 3`, `p-min 0.3` |
 | KV | F16 |
 
+**Do not launch this by hand. The recipe is `~/models/bin/qwen-q40-server.sh`,** which is the
+authoritative configuration and carries the measurement behind every setting in its comments. It is
+outside this repo, so what follows is a mirror, not the source of truth.
+
 ```bash
-llama-server -m <first shard> \
-  -ngl 99 --moe-stream --moe-stream-cache 32 --moe-stream-io-threads 8 \
-  -c 131072 -b 4096 -ub 4096 -cms 4096 -np 1 -fa on \
-  -md <mtp-…-Q4_0.gguf> \
+~/models/bin/qwen-q40-server.sh          # cache 34, ctx 98304, MTP n-max 3 / p-min 0.3
+```
+
+Which expands to roughly:
+
+```bash
+LLAMA_MOE_STREAM_LOOKAHEAD=1 LLAMA_MOE_STREAM_WAVE_CAP=200 LLAMA_MOE_STREAM_PARTITION=1 \
+llama-server -m <first shard> -md <mtp-shared head> \
+  -ngl 99 --moe-stream --moe-stream-cache 34 --moe-stream-io-threads 8 \
+  -c 98304 -b 4096 -ub 4096 -cms 4096 -np 1 -fa on \
+  --cache-reuse 0 --cache-ram 512 \
+  --jinja --reasoning-format deepseek \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 --spec-draft-ngl 99 \
   --spec-max-prompt 0
 ```
 
-**Cache 30-32 with MTP.** Wired memory cannot be swapped and `iogpu.wired_limit` is 58 of 64 GiB, so
-the only elastic pool is the page cache — which is exactly where the expert and PLE reads live, both
-being buffered rather than `O_DIRECT`. When that cushion is exhausted, anonymous pages swap. Watch
-`sysctl -n vm.swapusage`, not free RAM, which macOS keeps near zero by design.
+**Cache 34, and the wired limit moves with it.** Wired memory cannot be swapped, so
+`iogpu.wired_limit_mb` is the safety cap on the whole machine, not a tuning knob — past it Metal
+raises a GPU OOM the server reports and survives, instead of the laptop going unresponsive. The
+script derives it: cache ≤ 32 → 50176 MiB, cache ≥ 33 → 55296 MiB. **Setting one without the other
+is how you get a GPU OOM at load.**
+
+| cache | model wires | verdict |
+|---:|---:|---|
+| 32 | 46.96 GiB, peak 47.13 under prefill | conservative; zero new swapouts across the test |
+| 34 | 51.03 GiB total wired (2026-09-04) | current default; holds up in live use |
+| 36 | 51.40 GiB, free memory 0.06 GiB | fastest (~14% prefill) and **the state the machine hung in** |
+
+Watch `sysctl -n vm.swapusage`, not free RAM, which macOS keeps near zero by design. Note that free
+memory is ~0.06 GiB at cache 34 as well; what separates it from 36 is that the machine stays
+responsive, and that is one steady-state sample, not a peak-under-prefill measurement.
 
 ---
 
 ## The checkpoint
+
+Two custom splices exist. **`Q4_0-Q8out-v3` is the default**; `UD-iQ4_K_XXS` is the smaller one and
+is what the kernel survey below was built to justify.
+
+### `Q4_0-Q8out-v3` — the default, chosen for quality
+
+bartowski's `Q4_0` with this project's `Q8_0` `output.weight` spliced in, then **unsloth's
+`UD-IQ4_XS` spliced into five resident tensor groups**: `attn`, `hc`, `token_embd`, `ssm_out`,
+`shexp`. Built 2026-09-02 with `gguf_splice_groups.py --groups attn,hc,token_embd,ssm_out,shexp`.
+
+**It was chosen over `UD-iQ4_K_XXS` for quality, not speed.** Its gate/up experts are `Q4_0` at
+4.5 bpw against `IQ3_XXS` at 3.06 bpw, and that is 55% of expert weight. On speed the two are level:
+26.5 t/s against 26.0, each at its own best draft depth (measured 2026-08-31).
+
+What the five-group splice buys, against the unspliced `Q4_0-Q8out`, paired 40-chunk perplexity plus
+an interleaved speed A/B:
+
+| | unspliced | v3 | change |
+|---|---:|---:|---|
+| perplexity | 5.2777 | 4.3148 | **−17.79%**, t=7.80, better on 40/40 chunks |
+| draft acceptance | 0.751 | 0.817 | +0.066 |
+| decode | — | — | −2.7% |
+| prefill | — | — | unchanged |
+| on disk | — | — | +1.69 GiB |
+
+Hyper-connections alone are −13.14% perplexity for +0.30 GiB; attention adds −8.80% for +0.92 GiB.
+
+**Do not trim the group list on perplexity alone.** `attn,hc,token_embd` measures the same −17.5%,
+but draft acceptance falls to 0.710 and decode drops 14%: `ssm_out` and `shexp` are worthless for
+perplexity and worth about 11 points of decode.
+
+### `UD-iQ4_K_XXS` — the smaller alternative
 
 `UD-iQ4_K_XXS` is a custom splice, built here rather than downloaded: unsloth's `UD-Q3_K_XL` with 43
 of its 48 `ffn_down_exps` replaced byte-for-byte with **MXFP4** from AtomicChat's
@@ -141,6 +196,25 @@ hand-optimised Metal GEMV here, and both are far better placed than the `IQ3_XXS
 
 The `ffn_gate`/`ffn_up` pair remains `IQ3_XXS` because it is the bulk of the file and the size
 budget has to come from somewhere; `ffn_down` is where the format change buys the most per GiB spent.
+
+---
+
+## The serving configuration
+
+Settings that are not defaults, each with the measurement that chose it. These lived only in
+`~/models/bin/qwen-q40-server.sh` until 2026-09-04; that script is still the source of truth and
+carries the longer version of each note.
+
+| Setting | Default | Here | Why |
+|---|---|---|---|
+| `LLAMA_MOE_STREAM_LOOKAHEAD` | `n_expert_used` = **10** | **1** | The one-layer-ahead prefetch defaults to the routing width. At 10 it spends drive bandwidth on experts the layer will not use. The in-code table (measured on DSV4-Flash) shows over-wide lookahead going *worse than off* — top-16 dropped 7.3 → 5.0 t/s because ~1000 speculative loads per 2 s starve the demand loads the GPU is blocked on |
+| `LLAMA_MOE_STREAM_WAVE_CAP` | 139 (4 waves) | **200** (3 waves) | pp 268.30 → 278.39, tg 22.43 → 23.51 at 44.8k. An interior optimum: at 279 (2 waves) the lost preload overlap costs more than the saved masked passes. Lossless — only GEMM scheduling changes. See [WAVE_CAP forces off a safety net](#wave_cap-forces-off-a-safety-net-2026-09-04) |
+| `LLAMA_MOE_STREAM_PARTITION` | off | **on** | pp 278.27 → 297.87, tg 23.53 → 24.06. Paired 40-chunk perplexity **bit-identical** with it off, all 40 chunks matching (4.3387 both). It changes how pairs are assigned to waves, not what is computed |
+| `--cache-ram` | 8192 MiB | **512** | The server's store of saved prompt/KV states in plain host RAM — the same pool macOS competes for. Over a 3h13m session, 77 of 82 slot selections hit the live slot by prefix similarity and only 5 by LRU; the prompt cache appears 6 times and **all 6 are evictions**, throwing away 4.87 and 4.67 GiB. It was holding multiple GiB to serve nothing |
+| `--cache-reuse` | 256 | **0** | The caching win comes entirely from exact-prefix reuse, which `cache_prompt` already gives you: turn 1 prefilled 1253 tokens in 7.1 s, turn 2 prefilled 27 in 0.77 s — identical at 256 and at 0. `--cache-reuse N` shifts KV chunks past a divergence, which is **approximate**: output can differ where two tokens were nearly tied. Not a risk worth taking for an unmeasured gain |
+| `--moe-stream-io-threads` | auto | **8** | 8 / 12 / 16 are indistinguishable |
+| `-ub` | 512 | **4096** | The single largest prefill parameter. 8192 GPU-OOMs at cache 36; 2048 costs 11.6% prefill |
+| Google Drive | running | **quit for the run** | The repo lives in a Drive sync target, so Drive re-uploads `build/` while the model streams experts off the same SSD. Measured at ~1.9 GB resident and 61% CPU. The script quits it and restores on exit |
 
 ---
 
