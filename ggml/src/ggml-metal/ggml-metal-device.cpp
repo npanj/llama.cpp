@@ -521,13 +521,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, ggml_op op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, const ggml_tensor * op) {
     const char * name = nullptr;
 
-    switch (op) {
+    switch (op->op) {
         case GGML_OP_DSV4_HC_COMB: name = "kernel_dsv4_hc_comb_f32"; break;
-        case GGML_OP_DSV4_HC_PRE:  name = "kernel_dsv4_hc_pre_f32";  break;
-        case GGML_OP_DSV4_HC_POST: name = "kernel_dsv4_hc_post_f32"; break;
+        case GGML_OP_DSV4_HC_PRE:  name = ggml_get_op_params_i32(op, 1) != 0 ? "kernel_dsv4_hc_pre_gated_f32" : "kernel_dsv4_hc_pre_f32"; break;
+        case GGML_OP_DSV4_HC_POST: name = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32"; break;
         default: GGML_ABORT("fatal error");
     }
 
