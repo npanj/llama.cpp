@@ -440,9 +440,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // (mirror of llama_model_qwen4exp::graph::build_hc_mix)
     auto hc_mix = [&](ggml_tensor * x3d, ggml_tensor * w_norm, ggml_tensor * w_down,
                       ggml_tensor * w_up, ggml_tensor * w_inject, ggml_tensor ** inject) {
-        ggml_tensor * xn = ggml_rms_norm(ctx0, x3d, hparams.f_norm_rms_eps);
+        // scale while still [n_embd, hc, T], because the gamma now loads as [n_embd, hc] - the
+        // same order build_hc_mix uses, which also keeps RMS_NORM -> MUL adjacent for Metal fusion
+        ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x3d, hparams.f_norm_rms_eps), w_norm);
         xn = ggml_reshape_2d(ctx0, xn, hc_dim, n_tokens);
-        xn = ggml_mul(ctx0, xn, w_norm);
 
         ggml_tensor * lo = build_lora_mm(w_down, xn);
         lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
