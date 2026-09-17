@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-fusion.h"
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -1304,6 +1305,9 @@ struct ggml_metal_device {
 
     struct ggml_metal_device_props props;
 
+    // shared fusion debugging context
+    struct ggml_metal_fusion_info * finfo;
+
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 
@@ -1688,6 +1692,13 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     dev->props.max_working_set_size   = dev->mtl_device.maxBufferLength;
                 }
 
+                {
+                    const char * val = getenv("GGML_METAL_FUSION_DEBUG");
+                    dev->finfo = ggml_metal_fusion_info_init(
+                            getenv("GGML_METAL_FUSION_DISABLE") == nil,
+                            val ? atoi(val) : 0);
+                }
+
                 snprintf(dev->props.name, sizeof(dev->props.name), "%s%d", "MTL", device);
                 const char * gpu_name = [[dev->mtl_device name] UTF8String];
                 if (n_devices > 1) {
@@ -1762,6 +1773,8 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
     @autoreleasepool {
+        ggml_metal_fusion_info_free(dev->finfo);
+
         ggml_metal_rsets_free(dev->rsets);
 
         if (dev->moe_event) {
@@ -2340,6 +2353,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->type         == GGML_TYPE_F32 &&
                 op->src[0]->ne[1] == 4 &&
                 op->src[1]->ne[0] == 4 &&
+                op->src[1]->ne[2] == 1 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_DSV4_HC_POST:
@@ -2347,6 +2361,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3] != NULL &&
                 op->src[3]->type == GGML_TYPE_F32 &&
                 op->type         == GGML_TYPE_F32 &&
                 op->src[1]->ne[1] == 4 &&
@@ -2483,6 +2498,10 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev) {
     dev->props.has_tensor = false;
+}
+
+struct ggml_metal_fusion_info * ggml_metal_device_get_fusion_info(ggml_metal_device_t dev) {
+    return dev->finfo;
 }
 
 //
