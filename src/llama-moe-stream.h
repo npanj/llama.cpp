@@ -420,6 +420,20 @@ struct llama_moe_stream {
     llama_moe_stream_stats stats_prev;
     void maybe_dump_stats_locked();
 
+    // Per-expert selection counts, to answer "is expert usage skewed enough to be worth exploiting?"
+    // (e.g. giving rarely-routed experts fewer bits). Off unless LLAMA_MOE_STREAM_HOTNESS is set;
+    // rides the LLAMA_MOE_STREAM_STATS_MS dump so it needs no new trigger. NOTE: route_hotness decays
+    // (halves every hot_decay_interval), so this measures RECENT usage - set
+    // LLAMA_MOE_STREAM_HOT_DECAY=0 for cumulative counts.
+    void dump_route_hotness_locked() const;
+
+    bool dump_hotness = false;
+
+    // LLAMA_MOE_STREAM_HOTNESS_JSON=<path>: also write the FULL per-layer selection counts there,
+    // rewritten on every dump so the last write is the run's final state. Feeds the keep-manifest
+    // that gguf_prune_experts.py consumes ({"<layer>": [expert ids]}), via a small python step.
+    std::string hotness_json;
+
     // internals
     void start_workers_locked();
     void worker_loop();
