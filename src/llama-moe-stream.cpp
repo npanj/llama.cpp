@@ -7,6 +7,10 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstdio>       // fopen/fprintf/rename, for the route-hotness json dump
+#include <functional>   // std::greater, for the route-hotness sort
+#include <numeric>      // std::accumulate, for the route-hotness totals
+#include <string>       // std::string, for the json path
 #include <cstring>
 #include <stdexcept>
 
@@ -159,6 +163,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
     if (const char * s = std::getenv("LLAMA_MOE_STREAM_STATS_MS")) {
         stats_dump_us = std::max<int64_t>(0, std::atoll(s))*1000;
+    }
+
+    dump_hotness = std::getenv("LLAMA_MOE_STREAM_HOTNESS") != nullptr;
+
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_HOTNESS_JSON")) {
+        hotness_json = s;
+        dump_hotness = true;   // the json path implies the dump
     }
 
     // MUST be read here and not in open_files: create_cache_tensor decides whether to allocate the
@@ -839,8 +850,130 @@ void llama_moe_stream::maybe_dump_stats_locked() {
         }
     }
 
+    if (dump_hotness) {
+        dump_route_hotness_locked();
+    }
+
     stats_t_last_us = now;
     stats_prev      = stats;
+}
+
+// How concentrated is expert routing? For each streamed layer the selection counts are sorted and
+// the cumulative share held by the hottest 12.5%/25%/50% of experts is computed, then averaged over
+// layers. Flat traffic (12.5% of experts taking ~12.5% of selections) says a per-expert precision
+// scheme has nothing to exploit; a steep curve says it might. Caller holds mtx.
+void llama_moe_stream::dump_route_hotness_locked() const {
+    const size_t frac_n = 3;
+    const double fracs[frac_n] = { 0.125, 0.25, 0.5 };
+    double   share_sum[frac_n] = { 0.0, 0.0, 0.0 };
+    int64_t  n_layers_seen = 0;
+    uint64_t total_all     = 0;
+
+    for (const auto & sl : layers) {
+        if (sl == nullptr || sl->route_hotness.empty()) {
+            continue;
+        }
+        std::vector<uint32_t> h = sl->route_hotness;
+        const uint64_t total = std::accumulate(h.begin(), h.end(), (uint64_t) 0);
+        if (total == 0) {
+            continue;
+        }
+        total_all += total;
+        std::sort(h.begin(), h.end(), std::greater<uint32_t>());
+        for (size_t f = 0; f < frac_n; f++) {
+            const size_t k   = std::max<size_t>(1, (size_t)(h.size()*fracs[f]));
+            uint64_t     cum = 0;
+            for (size_t i = 0; i < k && i < h.size(); i++) {
+                cum += h[i];
+            }
+            share_sum[f] += 100.0*cum/total;
+        }
+        n_layers_seen++;
+    }
+
+    if (n_layers_seen == 0) {
+        LLAMA_LOG_WARN("%s: moe stream: route hotness: no selections recorded yet\n", __func__);
+        return;
+    }
+
+    LLAMA_LOG_WARN("%s: moe stream: route hotness over %" PRId64 " layers (%" PRIu64 " selections, %s): "
+                   "top 12.5%% of experts = %4.1f%% of traffic | top 25%% = %4.1f%% | top 50%% = %4.1f%% "
+                   "(flat would be 12.5/25/50)\n",
+            __func__, n_layers_seen, total_all,
+            hot_decay_interval > 0 ? "DECAYED, recent-weighted - set LLAMA_MOE_STREAM_HOT_DECAY=0 for cumulative"
+                                   : "cumulative",
+            share_sum[0]/n_layers_seen, share_sum[1]/n_layers_seen, share_sum[2]/n_layers_seen);
+
+    // one concrete layer, so the shape is visible and not just summarised
+    for (const auto & sl : layers) {
+        if (sl == nullptr || sl->route_hotness.empty()) {
+            continue;
+        }
+        std::vector<std::pair<uint32_t, int32_t>> v;
+        v.reserve(sl->route_hotness.size());
+        for (size_t e = 0; e < sl->route_hotness.size(); e++) {
+            v.emplace_back(sl->route_hotness[e], (int32_t) e);
+        }
+        std::sort(v.begin(), v.end(), std::greater<std::pair<uint32_t, int32_t>>());
+        char buf[256];
+        int  off = 0;
+        for (size_t i = 0; i < 8 && i < v.size() && off < (int) sizeof(buf); i++) {
+            const int n = snprintf(buf + off, sizeof(buf) - off, "%s#%d:%u",
+                    i ? " " : "", v[i].second, v[i].first);
+            // snprintf returns the length it WANTED, so off must not absorb it blindly:
+            // past the end, sizeof(buf) - off underflows and the next write leaves buf.
+            if (n < 0 || n >= (int) (sizeof(buf) - off)) {
+                off = (int) sizeof(buf) - 1;
+                break;
+            }
+            off += n;
+        }
+        LLAMA_LOG_WARN("%s: moe stream: layer %d hottest experts: %s | coldest count = %u\n",
+                __func__, sl->il, buf, v.back().first);
+        break;
+    }
+
+    // Full per-layer counts for offline use (building a keep-manifest). Rewritten each dump and
+    // written via a temp file + rename, so a reader never sees a half-written file if the server
+    // is killed mid-write.
+    if (!hotness_json.empty()) {
+        // A model and its MTP draft each own a llama_moe_stream, and both would write this path -
+        // the draft (1 layer) clobbering the model (48). Give each instance its own file by
+        // suffixing the streamed-layer count: counts.json -> counts.48L.json / counts.1L.json.
+        std::string path = hotness_json;
+        const size_t dot = path.find_last_of('.');
+        const std::string suffix = "." + std::to_string(n_layers_seen) + "L";
+        path = (dot == std::string::npos || path.find('/', dot) != std::string::npos)
+             ? path + suffix
+             : path.substr(0, dot) + suffix + path.substr(dot);
+
+        const std::string tmp = path + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("%s: moe stream: cannot write %s\n", __func__, tmp.c_str());
+            return;
+        }
+        fprintf(f, "{\n  \"decayed\": %s,\n  \"selections_total\": %" PRIu64 ",\n  \"layers\": {",
+                hot_decay_interval > 0 ? "true" : "false", total_all);
+        bool first_layer = true;
+        for (const auto & sl : layers) {
+            if (sl == nullptr || sl->route_hotness.empty()) {
+                continue;
+            }
+            fprintf(f, "%s\n    \"%d\": [", first_layer ? "" : ",", sl->il);
+            first_layer = false;
+            for (size_t e = 0; e < sl->route_hotness.size(); e++) {
+                fprintf(f, "%s%u", e ? "," : "", sl->route_hotness[e]);
+            }
+            fprintf(f, "]");
+        }
+        fprintf(f, "\n  }\n}\n");
+        fclose(f);
+        if (rename(tmp.c_str(), path.c_str()) != 0) {
+            LLAMA_LOG_WARN("%s: moe stream: cannot rename %s -> %s\n",
+                    __func__, tmp.c_str(), path.c_str());
+        }
+    }
 }
 
 void llama_moe_stream::print_stats() const {
