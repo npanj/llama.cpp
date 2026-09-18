@@ -17,7 +17,8 @@ Stock llama.cpp cannot do this. It will try to load all 95.5 GiB into memory and
 | **expert cache** | A fixed slice of RAM that holds recently-used experts so you don't re-read them from SSD every token. Bigger = faster, until it starves macOS. |
 | **MTP** (multi-token prediction) | A small extra "draft head" that guesses the next few tokens. The big model checks the guesses in one pass. Correct guesses are nearly free speed. |
 | **wired memory** | Memory macOS is not allowed to page out to disk. The GPU needs its weights wired. If you wire too much, the whole machine freezes. |
-| **prefill** | Reading your prompt. **decode** | Writing the answer, one token at a time. |
+| **prefill** | Reading your prompt, before any answer appears. |
+| **decode** | Writing the answer, one token at a time. |
 
 ---
 
@@ -57,32 +58,76 @@ you cloned this fork and are on the default branch.
 
 ## 3. Get the model
 
-Two files. Both are needed for the fast configuration.
+### 3a. The checkpoint — 95.5 GiB, 3 shards
 
-**The model itself** — 95.5 GiB, split into 3 shards. Download all three; point llama.cpp at the
-first one and it finds the rest.
+**<https://huggingface.co/nitinpanj/qwen38-flash-next-v3>**
 
+Download all three shards into one directory. You point llama.cpp at the *first* one and it finds
+the rest.
+
+```bash
+D=~/models/qwen38-flash-next-v3
+mkdir -p $D
+for i in 1 2 3; do
+  curl -fL --retry 5 -C - -o $D/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-0000$i-of-00003.gguf \
+    https://huggingface.co/nitinpanj/qwen38-flash-next-v3/resolve/main/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-0000$i-of-00003.gguf
+done
 ```
-<HF_MODEL_URL>
+
+<details>
+<summary>What "V3" means, if you're curious</summary>
+
+bartowski's Q4_0 with a Q8_0 `output.weight` spliced in, plus unsloth's UD-IQ4_XS spliced into five
+tensor groups that stay resident in memory (`attn`, `hc`, `token_embd`, `ssm_out`, `shexp`).
+
+Measured against the unspliced checkpoint, paired 40-chunk perplexity:
+**5.2777 → 4.3148, a 17.8% improvement**, better on 40 of 40 chunks, for +1.69 GiB on disk and
+−2.7% decode speed. Draft acceptance also rose, 0.751 → 0.817.
+
+The resident groups are not arbitrary. Trimming the list to `attn,hc,token_embd` measures the same
+perplexity but drops decode 14% — `ssm_out` and `shexp` are worthless for perplexity and worth
+about 11 points of decode.
+</details>
+
+### 3b. The MTP draft head — the +50% speed part
+
+This is the small "guesser" model from the table above. **Without it you run at ~18 tokens/sec
+instead of ~27.**
+
+> **⚠️ You cannot use a HuggingFace MTP sidecar directly.** Every published sidecar uses upstream
+> tensor naming; this fork expects different names. The file will not load as-is.
+
+You have two options.
+
+**Option 1 — build it yourself** (~5 minutes, Python standard library only):
+
+```bash
+D=~/models/qwen38-flash-next-mtp
+mkdir -p $D
+
+curl -fL --retry 5 -C - -o $D/mtp-src-Q4_K_M.gguf \
+  https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
+
+python3 scripts/mtp/mtp_sidecar.py \
+  --src $D/mtp-src-Q4_K_M.gguf \
+  --out $D/mtp-Q4_K_M.gguf
 ```
 
-**The MTP draft head** — the small "guesser" model described above. Without it you lose roughly a
-third of your generation speed.
+This does two tensor renames and one split, byte-exact — no requantization. Details and the
+verification step are in [`scripts/mtp/README.md`](../scripts/mtp/README.md).
 
-```
-<HF_MTP_URL>
-```
+**After building it, check draft acceptance is near 0.50 in the server logs.** A bad conversion
+does not error — the server starts normally and the draft head silently contributes nothing.
 
-Put them wherever you like. This guide assumes:
+**Option 2 — run without it.** Drop the four `--spec-*` flags and `-md` from the command in §5.
+Everything still works, just slower.
+
+### Where this guide assumes the files live
 
 ```
 ~/models/qwen38-flash-next-v3/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-00001-of-00003.gguf
-~/models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf
+~/models/qwen38-flash-next-mtp/mtp-Q4_K_M.gguf
 ```
-
-> **Note on the draft head.** The shared-head file strips its own token embeddings and borrows
-> them from the main model. That saves 0.8 GiB and is output-identical. It **cannot be loaded on
-> its own** — only as `-md` alongside the main model.
 
 ---
 
@@ -125,7 +170,7 @@ export LLAMA_QWEN4EXP_SPARSE_FA=1
 
 ./build/bin/llama-server \
   -m ~/models/qwen38-flash-next-v3/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-00001-of-00003.gguf \
-  -md ~/models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf \
+  -md ~/models/qwen38-flash-next-mtp/mtp-Q4_K_M.gguf \
   -ngl 99 \
   --moe-stream --moe-stream-cache 36 --moe-stream-io-threads 8 --moe-stream-direct \
   -c 98304 -b 4096 -ub 4096 -cms 512 -np 1 -fa on \
@@ -218,8 +263,10 @@ generation speed, and it is the configuration with the most evidence behind it.
 - If your file sync client (Dropbox, Google Drive) is watching the model directory, pause it.
 
 **The draft head accepts nothing / generation got slower with MTP on.**
-Make sure you are passing the *shared* head via `-md` together with the main model. It cannot run
-standalone.
+First check draft acceptance in the server logs. If it is near **zero**, the conversion in §3b
+picked the wrong half of `eh_proj` — rebuild it *without* `--swap-halves`. If acceptance is near
+0.50 and speed is still low, make sure you passed the head via `-md` alongside the main model; a
+shared-layout head cannot run standalone.
 
 **Generation was fast, then permanently dropped mid-conversation.**
 You set `--spec-max-prompt` to a number. Set it to `0`. See §5.
@@ -235,6 +282,8 @@ You set `--spec-max-prompt` to a number. Set it to `0`. See §5.
 - [`Qwen3.8-Flash-Next.md`](Qwen3.8-Flash-Next.md) — notes on this model architecture specifically.
 - [`moe-spec-verify-kernel.md`](moe-spec-verify-kernel.md) — a research log on a fused Metal verify
   kernel. Conclusion: closed, don't retry. Kept so nobody repeats it.
+- [`scripts/mtp/README.md`](../scripts/mtp/README.md) — exactly what the draft-head conversion does,
+  and how to verify you got it right.
 
 ---
 
