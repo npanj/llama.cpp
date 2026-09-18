@@ -6,13 +6,13 @@ Apple Silicon.
 
 ---
 
-# ⚡ Quick start — Qwen3.8-Flash-Next V3 on a 64 GB Mac
+# Quick start: Qwen3.8-Flash-Next V3 on a 64 GB Mac
 
-**You need:** an Apple Silicon Mac with **64 GB** memory and **~100 GB free on the internal SSD**.
-Five steps, about an hour — nearly all of it downloading.
+You need an Apple Silicon Mac with 64 GB of memory and about 100 GB free on the internal SSD.
+Five steps, roughly an hour, nearly all of it downloading.
 
-**Why this fork and not stock llama.cpp:** upstream has the model architecture, but not
-`--moe-stream`, the flag that lets a 95.5 GiB model run on a 64 GB machine.
+Stock llama.cpp will not do. It has the model architecture but not `--moe-stream`, which is the
+flag that lets a 95.5 GiB model run on a 64 GB machine.
 
 ### 1. Build it
 
@@ -23,7 +23,7 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8 --config Release
 ```
 
-### 2. Download the model — 95.5 GiB, 3 shards
+### 2. Download the model (95.5 GiB, 3 shards)
 
 ```bash
 D=~/models/qwen38-flash-next-v3 && mkdir -p $D
@@ -33,7 +33,7 @@ for i in 1 2 3; do
 done
 ```
 
-### 3. Download the draft head — 1.9 GiB, worth ~50% more speed
+### 3. Download the draft head (1.9 GiB, worth ~50% more speed)
 
 ```bash
 D=~/models/qwen38-flash-next-mtp && mkdir -p $D
@@ -43,7 +43,7 @@ curl -fL --retry 5 -C - -o $D/mtp-shared-Q4_K_M.gguf \
 
 ### 4. Let the GPU wire enough memory
 
-**Don't skip this** — without it the model fails to load. It resets on every reboot.
+Don't skip this. Without it the model fails to load. It also resets on every reboot.
 
 ```bash
 sudo sysctl iogpu.wired_limit_mb=59392
@@ -68,16 +68,15 @@ export LLAMA_MOE_STREAM_LOOKAHEAD=1 LLAMA_MOE_STREAM_WAVE_CAP=200 \
   --host 127.0.0.1 --port 8080
 ```
 
-**Open <http://127.0.0.1:8080>.** Or point any OpenAI-compatible client at
-`http://127.0.0.1:8080/v1`.
+Open <http://127.0.0.1:8080>, or point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
 
-First load takes a few minutes — it is reading 95.5 GiB off disk. On an M5 Pro you should see
-roughly **370 tokens/sec reading your prompt** and **~27 tokens/sec writing the answer**.
+First load takes a few minutes, since it is reading 95.5 GiB off disk. On an M5 Pro you should see
+around 370 tokens/sec reading your prompt and about 27 tokens/sec writing the answer.
 
-> **If something goes wrong** — the machine freezes, it won't load, or it's much slower than that —
-> the fixes are in **[docs/qwen38-flash-next-v3.md](docs/qwen38-flash-next-v3.md)**, which also
-> explains every flag above, what to change if your Mac isn't 64 GB, and how to build the draft head
-> yourself instead of downloading it.
+If something goes wrong, whether the machine freezes, it won't load, or it is much slower than
+that, the fixes are in [docs/qwen38-flash-next-v3.md](docs/qwen38-flash-next-v3.md). That guide
+also explains every flag above, what to change if your Mac isn't 64 GB, and how to build the draft
+head yourself instead of downloading it.
 
 ---
 
@@ -97,7 +96,7 @@ most of the optimisation effort targets prefill and long context rather than sho
 
 ## Support the upstream fork
 
-Expert streaming — the feature this whole fork is built around — comes from
+Expert streaming, which this whole fork is built around, comes from
 [mihailescu2m/llama.cpp](https://github.com/mihailescu2m/llama.cpp). If this work is useful to you,
 a donation to its author is greatly appreciated and helps fund continued development.
 
@@ -139,9 +138,9 @@ llama-server -m <first shard> \
   -c 131072 -b 4096 -ub 4096 -np 1 -fa on
 ```
 
-> For the **Qwen3.8-Flash-Next V3** checkpoint specifically, use the tuned command in
-> **[docs/qwen38-flash-next-v3.md](docs/qwen38-flash-next-v3.md)** instead — it adds the MTP draft
-> head and the measured cache/wired-limit pairing, which together are worth roughly +50% decode.
+> For the Qwen3.8-Flash-Next V3 checkpoint specifically, use the tuned command in
+> [docs/qwen38-flash-next-v3.md](docs/qwen38-flash-next-v3.md) instead. It adds the MTP draft head
+> and the measured cache and wired-limit pairing, together worth roughly +50% decode.
 
 Two parameters carry most of the performance:
 
@@ -176,17 +175,24 @@ Organised by the commit layers in this branch. The reasoning behind each is in t
 Metal sparse flash attention, indexed predecessor lookup and focused Metal kernel improvements are
 kept immediately above current llama.cpp master so they can be dropped when upstream merges them.
 
-These were still **open upstream** when this branch was cut (2026-09-17). They are carried here
-because each one measurably helps the Qwen3.8-Flash-Next V3 configuration. Credit to their authors:
+These were still open upstream when this branch was cut (2026-09-17). They are carried here
+because each one helps the Qwen3.8-Flash-Next V3 configuration. Credit to their authors.
+
+The figures below are each PR author's own, not re-measured here. Treat the prompt-reading numbers
+with particular care: `llama-bench` feeds uniform random tokens, which for this architecture means
+random access across the whole 26.8 GiB n-gram table. Real prompts reuse common trigrams and warm
+the page cache, so a fix aimed at page faults looks far larger under `llama-bench` than in use.
+Measured here on a real 11k-token prefill, bypassing the page cache entirely was worth +1.1%, inside
+run-to-run noise.
 
 | PR | What it does | Measured effect |
 |---|---|---|
-| [#29030](https://github.com/ggml-org/llama.cpp/pull/29030) | Read the 26.8 GiB PLE table with direct file reads instead of mmap page faults | prompt reading **+65% to +121%** |
-| [#28948](https://github.com/ggml-org/llama.cpp/pull/28948) | Fuse Metal MoE routing, MoE reduction, SSM_CONV+silu and RMS_NORM+SCALE | decode **+5-9%**, prefill **+4-6%** |
+| [#29030](https://github.com/ggml-org/llama.cpp/pull/29030) | Read the 26.8 GiB PLE table with direct file reads instead of mmap page faults | prompt reading +65% to +121% (`llama-bench`, see caveat above) |
+| [#28948](https://github.com/ggml-org/llama.cpp/pull/28948) | Fuse Metal MoE routing, MoE reduction, SSM_CONV+silu and RMS_NORM+SCALE | decode +5-9%, prefill +4-6% |
 | [#29000](https://github.com/ggml-org/llama.cpp/pull/29000) | Dedicated Metal kernels for the four-stream hyper-connection ops | HC ops were 10-15% of decode GPU time |
-| [#28213](https://github.com/ggml-org/llama.cpp/pull/28213) | Gather the top-2048 attended cells instead of masking full context | **+6%** at 31k ctx, **+50%** at 130k |
-| [#29019](https://github.com/ggml-org/llama.cpp/pull/29019) | Preserve batch order so the MTP head reads aligned hidden states | draft acceptance **+17%** |
-| [#29029](https://github.com/ggml-org/llama.cpp/pull/29029) | Skip unneeded F32 rescale in `mul_mm_id` on Metal | **+1-4%** on batched MoE GEMM |
+| [#28213](https://github.com/ggml-org/llama.cpp/pull/28213) | Gather the top-2048 attended cells instead of masking full context | +6% at 31k ctx, +50% at 130k |
+| [#29019](https://github.com/ggml-org/llama.cpp/pull/29019) | Preserve batch order so the MTP head reads aligned hidden states | draft acceptance +17% |
+| [#29029](https://github.com/ggml-org/llama.cpp/pull/29029) | Skip unneeded F32 rescale in `mul_mm_id` on Metal | +1-4% on batched MoE GEMM |
 
 If you are on this branch and one of these has since merged upstream, it is redundant here, not
 wrong.
@@ -273,20 +279,20 @@ kernels are occupancy-bound and lose to simpler formats that read more bytes.
 
 This is a fork of a fork. In order:
 
-1. **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — upstream. Everything not listed
-   above behaves exactly as upstream documents it; see
+1. [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), upstream. Everything not listed
+   above behaves exactly as upstream documents it. See
    [the upstream README](https://github.com/ggml-org/llama.cpp#readme) for supported backends, model
    conversion and the general tool set.
-2. **[mihailescu2m/llama.cpp](https://github.com/mihailescu2m/llama.cpp)** — where MoE expert
-   streaming, phase-aware ubatching, the persistent SSD context cache and MTP rejection sampling
-   come from. Without that work none of this runs.
-3. **This branch** — the six open upstream PRs listed above, the Metal and Qwen work in the sections
-   above, and the tuning documented in the research logs.
+2. [mihailescu2m/llama.cpp](https://github.com/mihailescu2m/llama.cpp), where MoE expert streaming,
+   phase-aware ubatching, the persistent SSD context cache and MTP rejection sampling come from.
+   Without that work none of this runs.
+3. This branch, which adds the six open upstream PRs listed above, the Metal and Qwen work in the
+   sections above, and the tuning documented in the research logs.
 
 Bugs found here that belong upstream are noted as such in the model logs.
 
 ### Reporting problems
 
-Open an issue on **this** repository, not on upstream — upstream maintainers cannot support code
-they have not merged. Please say which Mac and how much memory you have, and include the first ~30
-lines the server prints at startup.
+Open an issue on this repository rather than upstream, since upstream maintainers cannot support
+code they have not merged. Please say which Mac and how much memory you have, and include the first
+30 or so lines the server prints at startup.

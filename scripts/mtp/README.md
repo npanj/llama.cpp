@@ -1,11 +1,10 @@
 # Rebuilding the Qwen3.8-Flash-Next MTP draft head
 
-**What this is for.** The MTP draft head is a small model that guesses the next few tokens so the
-big model can check several at once. It is worth roughly **+50% generation speed** on
-Qwen3.8-Flash-Next.
+The MTP draft head is a small model that guesses the next few tokens so the big model can check
+several at once. It is worth roughly +50% generation speed on Qwen3.8-Flash-Next.
 
-**Why you need these scripts.** Every MTP sidecar published on HuggingFace uses upstream tensor
-naming. This fork expects different names. **The published file will not load here as-is.**
+Why you need these scripts: every MTP sidecar published on HuggingFace uses upstream tensor naming,
+and this fork expects different names. The published file will not load here as-is.
 `mtp_sidecar.py` converts it.
 
 If you downloaded a ready-made head from the model repo, you do not need any of this. This is for
@@ -15,7 +14,7 @@ rebuilding it yourself, or for auditing what was done.
 
 ## What the conversion actually does
 
-Two renames and one split. **Nothing is requantized** — tensor data is copied byte for byte.
+Two renames and one split. Nothing is requantized; tensor data is copied byte for byte.
 
 | upstream / unsloth | this fork |
 |---|---|
@@ -23,7 +22,7 @@ Two renames and one split. **Nothing is requantized** — tensor data is copied 
 | `blk.N.nextn.hc_head_norm` / `hc_head_down` / `hc_head_up` | `blk.N.nextn.hc_norm` / `hc_down` / `hc_up` |
 
 The split lands on a Q4_K super-block boundary (a 5120-element row is 20 blocks of 256, cut at
-2560), which is why it can be exact. Rows interleave in the file, so each row is cut separately — a
+2560), which is why it can be exact. Rows interleave in the file, so each row is cut separately. A
 single contiguous slice would be silently wrong.
 
 ---
@@ -44,20 +43,20 @@ python3 scripts/mtp/mtp_sidecar.py \
   --out $D/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
 ```
 
-Python 3 standard library only — no `pip install` needed.
+Python 3 standard library only, no `pip install` needed.
 
 ---
 
 ## ⚠️ Then check that it works
 
 **Never pass `--swap-halves`.** Which half of `eh_proj` is `fc_embd` cannot be read off the file.
-The wrong choice **does not raise an error** — it builds fine, the server starts fine, and drafting
+The wrong choice does not raise an error. It builds fine, the server starts fine, and drafting
 silently collapses. Measured both ways:
 
 | | draft acceptance |
 |---|---|
 | default | **~0.50** (mean draft length 3.0) |
-| `--swap-halves` | **0.00000** — 0 accepted out of 1186 |
+| `--swap-halves` | **0.00000**, 0 accepted out of 1186 |
 
 So after rebuilding, confirm acceptance is near 0.50 in the server logs. **Do not just check that
 the server started.** The failure mode here is a model that runs at normal-looking speed while the
@@ -68,22 +67,22 @@ draft head contributes nothing.
 ## The "shared" variant
 
 A shared head additionally omits `output.weight` and `token_embd.weight` and borrows the target
-model's copies, which are already resident in memory. That saves **0.82 GiB** (2.595 → 1.776 GiB)
-and measured **byte-identical output**.
+model's copies, which are already resident in memory. That saves 0.82 GiB (2.595 to 1.776 GiB) and
+measured byte-identical output.
 
-`mtp_sidecar.py` handles a shared-layout source — it prints a note and carries on.
+`mtp_sidecar.py` handles a shared-layout source: it prints a note and carries on.
 
 Two constraints:
 
-- A shared head **cannot be loaded on its own**. It only works as `-md` alongside the target model.
-- A sidecar must **never** tie `output` to `token_embd`. That collapses acceptance to zero.
+- A shared head cannot be loaded on its own. It only works as `-md` alongside the target model.
+- A sidecar must never tie `output` to `token_embd`. That collapses acceptance to zero.
 
 ---
 
 ## Credit
 
 The source sidecar is [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF).
-These scripts only rename and split its tensors; all the model weights are unsloth's work, and the
+These scripts only rename and split its tensors. All the model weights are unsloth's work, and the
 underlying model is Qwen's.
 
 `gguf_splice.py` is included because `mtp_sidecar.py` imports its GGUF header reader. It was

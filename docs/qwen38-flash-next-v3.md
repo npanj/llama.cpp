@@ -1,6 +1,6 @@
 # Running Qwen3.8-Flash-Next V3 on a 64 GB Mac
 
-**The short version.** This model's weights are 95.5 GiB. Your Mac has 64 GB. It still runs, at
+The short version: This model's weights are 95.5 GiB. Your Mac has 64 GB. It still runs, at
 roughly 24-27 tokens/sec, because this fork keeps the rarely-used parts of the model on your SSD
 and pulls them in only when a token actually needs them.
 
@@ -31,7 +31,7 @@ Stock llama.cpp cannot do this. It will try to load all 95.5 GiB into memory and
 | **OS** | macOS with Metal | The fast paths in this fork are Metal-only. |
 | **Build tools** | Xcode command line tools, CMake | `xcode-select --install`, `brew install cmake` |
 
-**The disk matters more than you'd think.** Expert streaming reads from SSD continuously while
+The disk matters more than you would think. Expert streaming reads from SSD continuously while
 generating. Internal Apple SSD is what these numbers were measured on.
 
 ---
@@ -51,14 +51,14 @@ Check it worked:
 ./build/bin/llama-server --help | grep moe-stream
 ```
 
-You should see four `--moe-stream*` flags. If you see nothing, you built stock llama.cpp — check
+You should see four `--moe-stream*` flags. If you see nothing, you built stock llama.cpp. Check
 you cloned this fork and are on the default branch.
 
 ---
 
 ## 3. Get the model
 
-### 3a. The checkpoint — 95.5 GiB, 3 shards
+### 3a. The checkpoint (95.5 GiB, 3 shards)
 
 **<https://huggingface.co/nitinpanj/qwen38-flash-next-v3>**
 
@@ -85,16 +85,16 @@ Measured against the unspliced checkpoint, paired 40-chunk perplexity:
 −2.7% decode speed. Draft acceptance also rose, 0.751 → 0.817.
 
 The resident groups are not arbitrary. Trimming the list to `attn,hc,token_embd` measures the same
-perplexity but drops decode 14% — `ssm_out` and `shexp` are worthless for perplexity and worth
+perplexity but drops decode 14%. `ssm_out` and `shexp` are worthless for perplexity and worth
 about 11 points of decode.
 </details>
 
-### 3b. The MTP draft head — the +50% speed part
+### 3b. The MTP draft head, worth about +50% speed
 
 This is the small "guesser" model from the table above. **Without it you run at ~18 tokens/sec
 instead of ~27.**
 
-**Just download it.** It is in the same repo, 1.9 GiB:
+Just download it. It is in the same repo, 1.9 GiB:
 
 ```bash
 D=~/models/qwen38-flash-next-mtp
@@ -103,7 +103,7 @@ curl -fL --retry 5 -C - -o $D/mtp-shared-Q4_K_M.gguf \
   https://huggingface.co/nitinpanj/qwen38-flash-next-v3/resolve/main/MTP/mtp-shared-Q4_K_M.gguf
 ```
 
-> **This file only works one way.** It has no token embeddings of its own — it borrows the main
+> This file only works one way. It has no token embeddings of its own, it borrows the main
 > model's, which is how it stays at 1.9 GiB instead of 2.6. So it must be passed with `-md`
 > *alongside* the V3 checkpoint, on this fork. It cannot be loaded on its own, and it will not work
 > on stock llama.cpp.
@@ -127,15 +127,15 @@ python3 scripts/mtp/mtp_sidecar.py \
   --out $D/mtp-Q4_K_M.gguf
 ```
 
-Two tensor renames and one split, byte-exact — no requantization. Full details in
+Two tensor renames and one split, byte-exact, with no requantization. Full details in
 [`scripts/mtp/README.md`](../scripts/mtp/README.md).
 
-**Then check draft acceptance is near 0.50 in the server logs.** A bad conversion does not error —
+Then check draft acceptance is near 0.50 in the server logs. A bad conversion does not error.
 the server starts normally and the draft head silently contributes nothing. If you built your own,
 use your output path in place of `mtp-shared-Q4_K_M.gguf` below.
 </details>
 
-**Don't want the draft head at all?** Drop the four `--spec-*` flags and `-md` from the command in
+Don't want the draft head at all? Drop the four `--spec-*` flags and `-md` from the command in
 §5. Everything still works, at ~18 tokens/sec instead of ~27.
 
 ### Where this guide assumes the files live
@@ -159,7 +159,7 @@ sudo sysctl iogpu.wired_limit_mb=59392
 
 **This resets on reboot.** Run it again after restarting, or add it to a login script.
 
-**What the number means.** 59392 MiB is 58 GiB. It is a *ceiling*, not a reservation — nothing is
+What the number means: 59392 MiB is 58 GiB. It is a ceiling, not a reservation, so nothing is
 consumed until the model loads. Its purpose is failure mode: past the cap, Metal raises an
 out-of-memory error the server reports and survives. Without a cap, macOS itself locks up.
 
@@ -200,7 +200,7 @@ export LLAMA_QWEN4EXP_SPARSE_FA=1
 Then open <http://127.0.0.1:8080>, or point any OpenAI-compatible client at
 `http://127.0.0.1:8080/v1`.
 
-**First load takes a few minutes** — it is reading 95.5 GiB off disk. Later loads are faster while
+First load takes a few minutes, since it is reading 95.5 GiB off disk. Later loads are faster while
 the file is still in the OS page cache.
 
 ### What each unusual flag is doing
@@ -216,12 +216,12 @@ the file is still in the OS page cache.
 | `--spec-draft-n-max 3` | Guess 3 tokens ahead. Measured optimum; 4 was slower in every test. |
 | `--spec-draft-p-min 0.3` | Skip guessing when the draft head isn't confident. Worth ~+10%. |
 | `--spec-max-prompt 0` | **No limit.** See the warning below. |
-| `--cache-reuse 0` | Off deliberately — the real caching win comes from exact-prefix reuse, which is already on. |
+| `--cache-reuse 0` | Off deliberately. The real caching win comes from exact-prefix reuse, which is already on. |
 | `-fa on` | Flash attention. |
 
 > **Don't set `--spec-max-prompt` to a number.** It compares your *whole* prompt against the limit
 > with no knowledge of the prompt cache, so in a running chat it switches the draft head off
-> permanently once your history crosses it — and never turns it back on. Measured live at a 16384
+> permanently once your history crosses it, and never turns it back on. Measured live at a 16384
 > limit: generation fell from 25.8 to 15.4 tokens/sec the moment context passed 16k. Only set a
 > limit for one-shot long prompts with short answers.
 
@@ -238,22 +238,22 @@ Measured on an Apple M5 Pro, 64 GB, with this exact configuration:
 | Generation, draft head **on** | ~27.6 tokens/sec |
 | Generation at 29k context, real chat traffic | ~20.6 tokens/sec |
 
-Generation slows as context fills — that is expected and is dominated by reading the attention
+Generation slows as context fills. That is expected, and is dominated by reading the attention
 cache, not by the streamed experts.
 
 ---
 
 ## 7. If your Mac isn't 64 GB
 
-**Less than 64 GB.** Lower `--moe-stream-cache` and the matching wired cap. The model still loads —
+Less than 64 GB: lower `--moe-stream-cache` and the matching wired cap. The model still loads,
 the cache is just RAM for speed, not a requirement. Expect it to be slower. Untested below 64 GB.
 
-**96 GB or 128 GB.** Raise the cache. But note the measured ceiling on *this* machine: at 38 GiB of
+96 GB or 128 GB: raise the cache. But note the measured ceiling on *this* machine: at 38 GiB of
 cache on a 64 GB Mac, generation **collapsed** from ~24 to ~3.7 tokens/sec as macOS started swapping
-the server's own heap. More cache is not monotonically better — raise it in small steps and watch
+the server's own heap. More cache is not monotonically better. Raise it in small steps and watch
 for swap.
 
-**Not a Mac.** `--moe-stream` is not Metal-specific in principle, but nothing here has been tuned or
+Not a Mac: `--moe-stream` is not Metal-specific in principle, but nothing here has been tuned or
 measured on CUDA or CPU. You are in unexplored territory.
 
 ---
@@ -265,7 +265,7 @@ Point `-m` at shard `00001-of-00003`. All three shards must be in the same direc
 
 **It fails at load with a GPU out-of-memory error.**
 Your wired cap is too low for your cache size. Match them using the table in §4. If it still fails,
-raise the cap in 2048 MiB steps — do not jump straight to the maximum.
+raise the cap in 2048 MiB steps rather than jumping straight to the maximum.
 
 **The whole machine freezes or becomes unresponsive.**
 Your wired cap is too *high*. macOS has been left too little memory. Drop to `--moe-stream-cache 32`
@@ -280,7 +280,7 @@ generation speed, and it is the configuration with the most evidence behind it.
 
 **The draft head accepts nothing / generation got slower with MTP on.**
 First check draft acceptance in the server logs. If it is near **zero**, the conversion in §3b
-picked the wrong half of `eh_proj` — rebuild it *without* `--swap-halves`. If acceptance is near
+picked the wrong half of `eh_proj`, so rebuild it without `--swap-halves`. If acceptance is near
 0.50 and speed is still low, make sure you passed the head via `-md` alongside the main model; a
 shared-layout head cannot run standalone.
 
@@ -291,14 +291,14 @@ You set `--spec-max-prompt` to a number. Set it to `0`. See §5.
 
 ## 9. Going deeper
 
-- [`architecture-and-tuning.md`](architecture-and-tuning.md) — how llama.cpp is built, where time
+- [`architecture-and-tuning.md`](architecture-and-tuning.md): how llama.cpp is built, where time
   and memory go, and every knob you can turn. Fork-only features are marked **[fork]**.
-- [`deployment-optimization-guide.md`](deployment-optimization-guide.md) — the quantitative
+- [`deployment-optimization-guide.md`](deployment-optimization-guide.md): the quantitative
   companion: tuning derived from bytes moved and FLOPs executed.
-- [`Qwen3.8-Flash-Next.md`](Qwen3.8-Flash-Next.md) — notes on this model architecture specifically.
-- [`moe-spec-verify-kernel.md`](moe-spec-verify-kernel.md) — a research log on a fused Metal verify
+- [`Qwen3.8-Flash-Next.md`](Qwen3.8-Flash-Next.md): notes on this model architecture specifically.
+- [`moe-spec-verify-kernel.md`](moe-spec-verify-kernel.md): a research log on a fused Metal verify
   kernel. Conclusion: closed, don't retry. Kept so nobody repeats it.
-- [`scripts/mtp/README.md`](../scripts/mtp/README.md) — exactly what the draft-head conversion does,
+- [`scripts/mtp/README.md`](../scripts/mtp/README.md): exactly what the draft-head conversion does,
   and how to verify you got it right.
 
 ---
@@ -311,5 +311,5 @@ rejection sampling come from. That work is the reason any of this runs at all.
 
 Upstream is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
 
-This branch additionally carries six pull requests that were still open upstream when it was cut —
+This branch additionally carries six pull requests that were still open upstream when it was cut.
 see the fork notes in the [README](../README.md).

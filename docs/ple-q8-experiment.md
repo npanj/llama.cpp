@@ -1,6 +1,6 @@
 # Does a higher-precision PLE table improve quality?
 
-**Status:** CLOSED — bar not cleared. Bar set 2026-09-18 **before** any measurement; result below.
+**Status:** CLOSED, bar not cleared. Bar set 2026-09-18 **before** any measurement; result below.
 
 **The question.** The PLE table is 26.82 GiB, 28% of the checkpoint, and sits at `Q4_0` while every
 other dense component is `Q8_0`. It is the largest remaining precision gap in the file. Does giving
