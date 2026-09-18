@@ -4,10 +4,21 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running MoE mod
 than available RAM** by streaming their routed experts from SSD on demand, tuned specifically for
 Apple Silicon.
 
-Target hardware: **M1 Max, 64 GB, ~400 GB/s**. Everything except the routed experts stays resident;
-the experts live in a bounded cache filled by demand loads and a one-layer-ahead prefetcher. The
-usable checkpoint size is therefore set by **disk throughput, not by RAM** — a 284B model in 107 GiB
-runs on a machine with 64 GB, at a speed that is genuinely usable for agentic coding.
+> ### ⚡ Just here to run the Qwen3.8-Flash-Next V3 model?
+>
+> **→ [Start here: Running Qwen3.8-Flash-Next V3 on a 64 GB Mac](docs/qwen38-flash-next-v3.md)**
+>
+> That guide is self-contained: what hardware you need, how to build, where to get the model, the
+> one `sysctl` step people skip, the exact server command, and what to do when it misbehaves.
+>
+> **You need this fork, not stock llama.cpp.** Upstream has the model architecture, but not
+> `--moe-stream` — the flag that lets a 95.5 GiB checkpoint run on a 64 GB machine.
+
+Target hardware: **Apple Silicon, 64 GB** — developed on an M1 Max (~400 GB/s) and an M5 Pro.
+Everything except the routed experts stays resident; the experts live in a bounded cache filled by
+demand loads and a one-layer-ahead prefetcher. The usable checkpoint size is therefore set by **disk
+throughput, not by RAM** — a 284B model in 107 GiB runs on a machine with 64 GB, at a speed that is
+genuinely usable for agentic coding.
 
 Decode at depth is dominated by the KV read, not by weight traffic, which is why streaming the
 experts costs so little once the context is deep. That is the entire premise of this approach, and
@@ -15,10 +26,11 @@ most of the optimisation effort targets prefill and long context rather than sho
 
 ---
 
-## Support the Project
+## Support the upstream fork
 
-If this work is useful to you, a small donation is greatly appreciated and helps fund continued
-development.
+Expert streaming — the feature this whole fork is built around — comes from
+[mihailescu2m/llama.cpp](https://github.com/mihailescu2m/llama.cpp). If this work is useful to you,
+a donation to its author is greatly appreciated and helps fund continued development.
 
 [![Donate with PayPal](https://www.paypalobjects.com/en_AU/i/btn/btn_donate_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=mihailescu2m%40gmail%2Ecom&lc=AU&item_name=memeka&item_number=odroid&currency_code=AUD&bn=PP%2DDonationsBF%3Abtn_donate_LG%2Egif%3ANonHosted)
 
@@ -50,11 +62,17 @@ kernel tables in the research logs are generated from:
 
 ## Running
 
+The generic shape of a streaming run:
+
 ```bash
 llama-server -m <first shard> \
   -ngl 99 --moe-stream --moe-stream-cache 40 --moe-stream-io-threads 8 \
   -c 131072 -b 4096 -ub 4096 -np 1 -fa on
 ```
+
+> For the **Qwen3.8-Flash-Next V3** checkpoint specifically, use the tuned command in
+> **[docs/qwen38-flash-next-v3.md](docs/qwen38-flash-next-v3.md)** instead — it adds the MTP draft
+> head and the measured cache/wired-limit pairing, which together are worth roughly +50% decode.
 
 Two parameters carry most of the performance:
 
@@ -88,6 +106,21 @@ Organised by the commit layers in this branch. The reasoning behind each is in t
 
 Metal sparse flash attention, indexed predecessor lookup and focused Metal kernel improvements are
 kept immediately above current llama.cpp master so they can be dropped when upstream merges them.
+
+These were still **open upstream** when this branch was cut (2026-09-17). They are carried here
+because each one measurably helps the Qwen3.8-Flash-Next V3 configuration. Credit to their authors:
+
+| PR | What it does | Measured effect |
+|---|---|---|
+| [#29030](https://github.com/ggml-org/llama.cpp/pull/29030) | Read the 26.8 GiB PLE table with direct file reads instead of mmap page faults | prompt reading **+65% to +121%** |
+| [#28948](https://github.com/ggml-org/llama.cpp/pull/28948) | Fuse Metal MoE routing, MoE reduction, SSM_CONV+silu and RMS_NORM+SCALE | decode **+5-9%**, prefill **+4-6%** |
+| [#29000](https://github.com/ggml-org/llama.cpp/pull/29000) | Dedicated Metal kernels for the four-stream hyper-connection ops | HC ops were 10-15% of decode GPU time |
+| [#28213](https://github.com/ggml-org/llama.cpp/pull/28213) | Gather the top-2048 attended cells instead of masking full context | **+6%** at 31k ctx, **+50%** at 130k |
+| [#29019](https://github.com/ggml-org/llama.cpp/pull/29019) | Preserve batch order so the MTP head reads aligned hidden states | draft acceptance **+17%** |
+| [#29029](https://github.com/ggml-org/llama.cpp/pull/29029) | Skip unneeded F32 rescale in `mul_mm_id` on Metal | **+1-4%** on batched MoE GEMM |
+
+If you are on this branch and one of these has since merged upstream, it is redundant here, not
+wrong.
 
 ### MoE expert streaming
 
@@ -167,10 +200,24 @@ kernels are occupancy-bound and lose to simpler formats that read more bytes.
 
 ---
 
-## Upstream
+## Lineage and credit
 
-This fork tracks [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Upstream documentation
-applies for everything not listed above; see [the upstream README](https://github.com/ggml-org/llama.cpp#readme)
-for supported backends, model conversion and the general tool set.
+This is a fork of a fork. In order:
+
+1. **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — upstream. Everything not listed
+   above behaves exactly as upstream documents it; see
+   [the upstream README](https://github.com/ggml-org/llama.cpp#readme) for supported backends, model
+   conversion and the general tool set.
+2. **[mihailescu2m/llama.cpp](https://github.com/mihailescu2m/llama.cpp)** — where MoE expert
+   streaming, phase-aware ubatching, the persistent SSD context cache and MTP rejection sampling
+   come from. Without that work none of this runs.
+3. **This branch** — the six open upstream PRs listed above, the Metal and Qwen work in the sections
+   above, and the tuning documented in the research logs.
 
 Bugs found here that belong upstream are noted as such in the model logs.
+
+### Reporting problems
+
+Open an issue on **this** repository, not on upstream — upstream maintainers cannot support code
+they have not merged. Please say which Mac and how much memory you have, and include the first ~30
+lines the server prints at startup.
