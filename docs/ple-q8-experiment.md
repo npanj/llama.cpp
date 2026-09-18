@@ -1,6 +1,6 @@
 # Does a higher-precision PLE table improve quality?
 
-**Status:** running. Bar set 2026-09-18, **before** any measurement.
+**Status:** CLOSED — bar not cleared. Bar set 2026-09-18 **before** any measurement; result below.
 
 **The question.** The PLE table is 26.82 GiB, 28% of the checkpoint, and sits at `Q4_0` while every
 other dense component is `Q8_0`. It is the largest remaining precision gap in the file. Does giving
@@ -85,11 +85,40 @@ quality in this model.
 
 ## Results
 
-_To be filled in. Nothing measured yet._
+40 chunks of `wiki.test.raw`, `-c 4096 -b 4096 -ub 4096`, expert cache 20 GiB, identical flags,
+only `-m` differing. Cache lowered from 36 to 20 because the 36 run was killed under memory
+pressure; perplexity does not depend on the expert cache, and both arms used the same value, so
+the paired comparison is unaffected.
 
-| | PPL | vs baseline | t | chunks better | prefill | decode |
-|---|---:|---:|---:|---:|---:|---:|
-| baseline (Q4_0 PLE) | | | | | | |
-| candidate (Q8_0 PLE) | | | | | | |
+| | PPL | vs baseline | t | chunks better |
+|---|---:|---:|---:|---:|
+| baseline (`Q4_0` PLE, 90 B/row) | 4.3308 | - | - | - |
+| candidate (`Q8_0` PLE, 170 B/row) | 4.3118 | **-0.44%** | **0.99** | **25/40** |
 
-**Verdict:** _pending_
+Bar was >2% at t>3. **Not cleared**, and not close.
+
+Sanity check: this baseline (4.3308) sits next to the historical v3 figure (4.3148) measured on a
+different day at a different cache size, so the harness agrees with itself.
+
+Speed A/B was not run. Adoption required clearing quality *and* speed; quality failed decisively,
+so the speed number cannot change the outcome. The predicted cost stands unmeasured: rows go
+90 -> 170 bytes, an 89% larger read per PLE gather.
+
+**Verdict: rejected. Do not adopt. Line closed.**
+
+## Why this is stronger than one null
+
+Two independent PLE experiments at two different precisions now both measure nothing:
+
+| experiment | change | vs baseline | t | chunks better |
+|---|---|---:|---:|---:|
+| earlier | `Q4_0` -> `IQ4_NL`, same bytes, better codebook | -2.03% | 1.98 | 26/40 |
+| this one | `Q4_0` -> `Q8_0`, +23.84 GiB, double the bits | -0.44% | 0.99 | 25/40 |
+
+**Doubling the bits did less than changing the codebook did.** If PLE precision mattered, that
+ordering would be hard to explain. Combined with the dense-trunk bisection, which attributed the
+entire -18.24% to a 3.55 GiB trunk, the conclusion is that **the PLE table does not carry quality
+in this model** - despite being 28% of the checkpoint.
+
+**Do not retry this line.** If a future checkpoint changes the PLE's role in the architecture, that
+is a new question; precision alone is answered.
