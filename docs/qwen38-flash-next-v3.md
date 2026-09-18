@@ -94,12 +94,26 @@ about 11 points of decode.
 This is the small "guesser" model from the table above. **Without it you run at ~18 tokens/sec
 instead of ~27.**
 
-> **⚠️ You cannot use a HuggingFace MTP sidecar directly.** Every published sidecar uses upstream
-> tensor naming; this fork expects different names. The file will not load as-is.
+**Just download it.** It is in the same repo, 1.9 GiB:
 
-You have two options.
+```bash
+D=~/models/qwen38-flash-next-mtp
+mkdir -p $D
+curl -fL --retry 5 -C - -o $D/mtp-shared-Q4_K_M.gguf \
+  https://huggingface.co/nitinpanj/qwen38-flash-next-v3/resolve/main/MTP/mtp-shared-Q4_K_M.gguf
+```
 
-**Option 1 — build it yourself** (~5 minutes, Python standard library only):
+> **This file only works one way.** It has no token embeddings of its own — it borrows the main
+> model's, which is how it stays at 1.9 GiB instead of 2.6. So it must be passed with `-md`
+> *alongside* the V3 checkpoint, on this fork. It cannot be loaded on its own, and it will not work
+> on stock llama.cpp.
+
+<details>
+<summary>Or build your own draft head, if you'd rather not trust a binary</summary>
+
+**You cannot use a HuggingFace MTP sidecar directly.** Every published sidecar uses upstream tensor
+naming; this fork expects different names. The file will not load as-is. Converting it takes about
+five minutes and Python's standard library:
 
 ```bash
 D=~/models/qwen38-flash-next-mtp
@@ -113,20 +127,22 @@ python3 scripts/mtp/mtp_sidecar.py \
   --out $D/mtp-Q4_K_M.gguf
 ```
 
-This does two tensor renames and one split, byte-exact — no requantization. Details and the
-verification step are in [`scripts/mtp/README.md`](../scripts/mtp/README.md).
+Two tensor renames and one split, byte-exact — no requantization. Full details in
+[`scripts/mtp/README.md`](../scripts/mtp/README.md).
 
-**After building it, check draft acceptance is near 0.50 in the server logs.** A bad conversion
-does not error — the server starts normally and the draft head silently contributes nothing.
+**Then check draft acceptance is near 0.50 in the server logs.** A bad conversion does not error —
+the server starts normally and the draft head silently contributes nothing. If you built your own,
+use your output path in place of `mtp-shared-Q4_K_M.gguf` below.
+</details>
 
-**Option 2 — run without it.** Drop the four `--spec-*` flags and `-md` from the command in §5.
-Everything still works, just slower.
+**Don't want the draft head at all?** Drop the four `--spec-*` flags and `-md` from the command in
+§5. Everything still works, at ~18 tokens/sec instead of ~27.
 
 ### Where this guide assumes the files live
 
 ```
 ~/models/qwen38-flash-next-v3/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-00001-of-00003.gguf
-~/models/qwen38-flash-next-mtp/mtp-Q4_K_M.gguf
+~/models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf
 ```
 
 ---
@@ -170,7 +186,7 @@ export LLAMA_QWEN4EXP_SPARSE_FA=1
 
 ./build/bin/llama-server \
   -m ~/models/qwen38-flash-next-v3/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-00001-of-00003.gguf \
-  -md ~/models/qwen38-flash-next-mtp/mtp-Q4_K_M.gguf \
+  -md ~/models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf \
   -ngl 99 \
   --moe-stream --moe-stream-cache 36 --moe-stream-io-threads 8 --moe-stream-direct \
   -c 98304 -b 4096 -ub 4096 -cms 512 -np 1 -fa on \

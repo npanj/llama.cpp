@@ -4,15 +4,84 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running MoE mod
 than available RAM** by streaming their routed experts from SSD on demand, tuned specifically for
 Apple Silicon.
 
-> ### ⚡ Just here to run the Qwen3.8-Flash-Next V3 model?
->
-> **→ [Start here: Running Qwen3.8-Flash-Next V3 on a 64 GB Mac](docs/qwen38-flash-next-v3.md)**
->
-> That guide is self-contained: what hardware you need, how to build, where to get the model, the
-> one `sysctl` step people skip, the exact server command, and what to do when it misbehaves.
->
-> **You need this fork, not stock llama.cpp.** Upstream has the model architecture, but not
-> `--moe-stream` — the flag that lets a 95.5 GiB checkpoint run on a 64 GB machine.
+---
+
+# ⚡ Quick start — Qwen3.8-Flash-Next V3 on a 64 GB Mac
+
+**You need:** an Apple Silicon Mac with **64 GB** memory and **~100 GB free on the internal SSD**.
+Five steps, about an hour — nearly all of it downloading.
+
+**Why this fork and not stock llama.cpp:** upstream has the model architecture, but not
+`--moe-stream`, the flag that lets a 95.5 GiB model run on a 64 GB machine.
+
+### 1. Build it
+
+```bash
+git clone https://github.com/npanj/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j8 --config Release
+```
+
+### 2. Download the model — 95.5 GiB, 3 shards
+
+```bash
+D=~/models/qwen38-flash-next-v3 && mkdir -p $D
+for i in 1 2 3; do
+  curl -fL --retry 5 -C - -o $D/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-0000$i-of-00003.gguf \
+    https://huggingface.co/nitinpanj/qwen38-flash-next-v3/resolve/main/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-0000$i-of-00003.gguf
+done
+```
+
+### 3. Download the draft head — 1.9 GiB, worth ~50% more speed
+
+```bash
+D=~/models/qwen38-flash-next-mtp && mkdir -p $D
+curl -fL --retry 5 -C - -o $D/mtp-shared-Q4_K_M.gguf \
+  https://huggingface.co/nitinpanj/qwen38-flash-next-v3/resolve/main/MTP/mtp-shared-Q4_K_M.gguf
+```
+
+### 4. Let the GPU wire enough memory
+
+**Don't skip this** — without it the model fails to load. It resets on every reboot.
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=59392
+```
+
+### 5. Run it
+
+```bash
+export LLAMA_MOE_STREAM_LOOKAHEAD=1 LLAMA_MOE_STREAM_WAVE_CAP=200 \
+       LLAMA_MOE_STREAM_PARTITION=1 LLAMA_QWEN4EXP_SPARSE_FA=1
+
+./build/bin/llama-server \
+  -m ~/models/qwen38-flash-next-v3/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-00001-of-00003.gguf \
+  -md ~/models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf \
+  -ngl 99 \
+  --moe-stream --moe-stream-cache 36 --moe-stream-io-threads 8 --moe-stream-direct \
+  -c 98304 -b 4096 -ub 4096 -cms 512 -np 1 -fa on \
+  --cache-reuse 0 --cache-ram 512 \
+  --jinja --reasoning-format deepseek \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 \
+  --spec-draft-ngl 99 --spec-max-prompt 0 \
+  --host 127.0.0.1 --port 8080
+```
+
+**Open <http://127.0.0.1:8080>.** Or point any OpenAI-compatible client at
+`http://127.0.0.1:8080/v1`.
+
+First load takes a few minutes — it is reading 95.5 GiB off disk. On an M5 Pro you should see
+roughly **370 tokens/sec reading your prompt** and **~27 tokens/sec writing the answer**.
+
+> **If something goes wrong** — the machine freezes, it won't load, or it's much slower than that —
+> the fixes are in **[docs/qwen38-flash-next-v3.md](docs/qwen38-flash-next-v3.md)**, which also
+> explains every flag above, what to change if your Mac isn't 64 GB, and how to build the draft head
+> yourself instead of downloading it.
+
+---
+
+## How this works
 
 Target hardware: **Apple Silicon, 64 GB** — developed on an M1 Max (~400 GB/s) and an M5 Pro.
 Everything except the routed experts stays resident; the experts live in a bounded cache filled by
