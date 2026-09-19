@@ -107,6 +107,12 @@ curl -fL --retry 5 -C - -o $D/mtp-shared-Q4_K_M.gguf \
 > model's, which is how it stays at 1.9 GiB instead of 2.6. So it must be passed with `-md`
 > *alongside* the V3 checkpoint, on this fork. It cannot be loaded on its own, and it will not work
 > on stock llama.cpp.
+>
+> Its tensor names are also fork-specific. Upstream PR
+> [#28243](https://github.com/ggml-org/llama.cpp/pull/28243) adds shared-MTP support for qwen4exp
+> using unsloth's original names, not the ones this fork renames to. If that lands, unsloth's
+> sidecar will work on upstream directly and this file still will not. See
+> [`scripts/mtp/README.md`](../scripts/mtp/README.md).
 
 <details>
 <summary>Or build your own draft head, if you'd rather not trust a binary</summary>

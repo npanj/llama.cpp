@@ -25,6 +25,22 @@ The split lands on a Q4_K super-block boundary (a 5120-element row is 20 blocks 
 2560), which is why it can be exact. Rows interleave in the file, so each row is cut separately. A
 single contiguous slice would be silently wrong.
 
+### This naming is fork-specific, and upstream is going the other way
+
+The names in the right-hand column exist only in this fork. Upstream PR
+[#28243](https://github.com/ggml-org/llama.cpp/pull/28243) adds shared-MTP support for qwen4exp and
+keeps the left-hand column instead: `eh_proj` stays whole at `[2*n_embd, n_embd]`, and the mixer
+tensors stay `hc_head_norm` / `hc_head_down` / `hc_head_up`.
+
+So if that PR merges:
+
+- unsloth's published sidecar will load on upstream llama.cpp with no conversion at all
+- a head converted by this script will **not** load on upstream, only here
+- this fork still will not load unsloth's original, which is why this script exists
+
+Nothing breaks today, and the conversion is still required for this tree. But it is a detour that
+upstream is on course to remove, so do not treat these names as standard.
+
 ---
 
 ## Rebuild it
